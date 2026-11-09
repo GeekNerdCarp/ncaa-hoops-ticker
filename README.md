@@ -15,7 +15,7 @@ A scrolling, LED-style men's college basketball score ticker for your Mac.
 
 ## Install
 
-1. Download **Hoops Ticker.dmg** from the [latest release](../../releases/latest).
+1. Download **Hoops-Ticker.dmg** from the [latest release](../../releases/latest). It's signed and notarized by Apple, so it opens without a security warning.
 2. Open it and drag **Hoops Ticker** into **Applications**.
 3. Launch it. The ticker appears along the bottom of your screen and 🏀 appears in the menu bar.
 

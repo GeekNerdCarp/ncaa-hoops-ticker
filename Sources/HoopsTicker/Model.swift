@@ -157,7 +157,11 @@ enum ESPN {
     /// Always asks for a specific date: ESPN's undated scoreboard keeps showing
     /// yesterday's games until well into the morning.
     static func fetchBoard(daysFromNow: Int) async throws -> [Game] {
-        let day = Calendar.current.date(byAdding: .day, value: daysFromNow, to: Date())!
+        try await fetchBoard(on: Calendar.current.date(byAdding: .day, value: daysFromNow, to: Date())!)
+    }
+
+    /// The scoreboard for the (Eastern time) date that contains `day`.
+    static func fetchBoard(on day: Date) async throws -> [Game] {
         let url = "\(base)/scoreboard?groups=50&limit=400&dates=\(dateParam.string(from: day))"
         let board = try await get(Board.self, url)
         return board.events.compactMap { $0.value }.compactMap(makeGame)

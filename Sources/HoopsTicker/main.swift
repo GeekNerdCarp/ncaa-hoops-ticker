@@ -15,7 +15,7 @@ enum Palette {
 }
 
 /// One attributed string per game (separator included), so the ticker only draws what's on screen.
-func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont) -> [NSAttributedString] {
+func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont, separator: Bool = true) -> [NSAttributedString] {
     var out = NSMutableAttributedString()
     var parts: [NSAttributedString] = []
     func add(_ s: String, _ c: NSColor) {
@@ -51,7 +51,7 @@ func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont) -> 
             team(g.home, showScore: false, live: false)
             add("   \(g.detail.uppercased())", Palette.upcoming)
         }
-        add("      ◆      ", Palette.dim)
+        if separator { add("      ◆      ", Palette.dim) }
         parts.append(out)
         out = NSMutableAttributedString()
     }
@@ -72,6 +72,7 @@ final class TickerView: NSView {
     private var liveLayers: [String: CALayer] = [:]   // "segment:copy" -> layer
     private var images: [Int: CGImage] = [:]          // segment -> rendered image
     private var tick: Timer?
+    private var centered = false   // one still segment in the middle instead of scrolling
 
     /// Points per frame at 60 fps (kept from the original timer-based ticker).
     var speed: CGFloat = 2.0 {
@@ -97,7 +98,9 @@ final class TickerView: NSView {
 
     func set(_ parts: [NSAttributedString]) {
         // Refreshes usually change nothing; skip the rebuild so scrolling isn't disturbed.
-        guard parts != lastParts else { return }
+        guard parts != lastParts || centered else { return }
+        let wasCentered = centered
+        centered = false
         lastParts = parts
         let keep = currentOffset()
         var x: CGFloat = 0
@@ -108,7 +111,19 @@ final class TickerView: NSView {
         }
         total = x
         clearLayers()
-        restart(at: total > 0 ? keep.truncatingRemainder(dividingBy: total) : 0)
+        restart(at: total > 0 && !wasCentered ? keep.truncatingRemainder(dividingBy: total) : 0)
+    }
+
+    /// Shows one segment, still and centered. Unchanged text costs nothing.
+    func setCentered(_ text: NSAttributedString) {
+        guard !centered || segments.first?.text != text else { return }
+        centered = true
+        lastParts = []
+        let w = ceil(text.size().width)
+        segments = [Segment(text: text, x: 0, width: w)]
+        total = w
+        clearLayers()
+        restart(at: 0)
     }
 
     /// Jump back so the first game is at the left edge.
@@ -117,6 +132,7 @@ final class TickerView: NSView {
     override func layout() {
         super.layout()
         accent.frame = CGRect(x: 0, y: Prefs.atTop ? 0 : bounds.height - 1, width: bounds.width, height: 1)
+        if centered { restart(at: 0) }
     }
 
     override func setFrameSize(_ newSize: NSSize) {
@@ -136,7 +152,7 @@ final class TickerView: NSView {
     // MARK: Scrolling
 
     private func currentOffset() -> CGFloat {
-        guard total > 0 else { return 0 }
+        guard total > 0, !centered else { return 0 }
         let x = (strip.presentation() ?? strip).position.x
         let o = (-x).truncatingRemainder(dividingBy: total)
         return o < 0 ? o + total : o
@@ -146,8 +162,9 @@ final class TickerView: NSView {
         strip.removeAllAnimations()
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        strip.position = CGPoint(x: -offset, y: 0)
+        strip.position = CGPoint(x: centered ? ((bounds.width - total) / 2).rounded() : -offset, y: 0)
         CATransaction.commit()
+        if centered { updateVisible(offset: 0); return }
         let pointsPerSecond = speed * 60
         if total > 0, pointsPerSecond > 0 {
             let anim = CABasicAnimation(keyPath: "position.x")
@@ -179,8 +196,9 @@ final class TickerView: NSView {
         let margin = bounds.width
         // Cover the visible window plus a margin, and the same window one loop earlier,
         // so the layers are already there when the animation wraps back to the start.
-        let ranges = [(off - margin, off + bounds.width + margin),
-                      (off - total - margin, off - total + bounds.width + margin)]
+        let ranges = centered ? [(CGFloat(0), total / 2)]
+            : [(off - margin, off + bounds.width + margin),
+               (off - total - margin, off - total + bounds.width + margin)]
         let scale = window?.backingScaleFactor ?? 2
         let h = bounds.height
 
@@ -284,6 +302,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var top25: [RankedTeam] = []
     private var lastUpdate: Date?
     private var lastError: String?
+    private var refreshTask: Task<Void, Never>?
+    private var lastFullRefresh = Date.distantPast
 
     private let lookaheadDays = 6
     private let barHeight: CGFloat = 44
@@ -320,7 +340,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if !Prefs.hidden { panel.orderFrontRegardless() }
         render()
 
-        Task { await refreshLoop() }
+        refreshTask = Task { await refreshLoop() }
         Task { await lookaheadLoop() }
         Task { await top25Loop() }
         Task { await loadTeams() }
@@ -347,19 +367,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refreshLoop() async {
         var first = true
-        while true {
-            do {
-                games = try await ESPN.fetchToday()
-                lastUpdate = Date()
-                lastError = nil
-            } catch {
-                lastError = error.localizedDescription
+        while !Task.isCancelled {
+            let quick = quickRefreshGame()
+            if let g = quick, Date().timeIntervalSince(lastFullRefresh) < 120 {
+                // Only-my-team mode during a game: fetch just that game's day, every 10 seconds.
+                if let day = try? await ESPN.fetchBoard(on: g.start),
+                   let fresh = day.first(where: { $0.id == g.id }),
+                   let i = games.firstIndex(where: { $0.id == g.id }) {
+                    games[i] = fresh
+                    lastUpdate = Date()
+                    lastError = nil
+                }
+            } else {
+                do {
+                    games = try await ESPN.fetchToday()
+                    lastUpdate = Date()
+                    lastFullRefresh = Date()
+                    lastError = nil
+                } catch {
+                    lastError = error.localizedDescription
+                }
             }
+            guard !Task.isCancelled else { return }
             render()
             if first, !games.isEmpty { ticker.resetToStart(); first = false }
             let anyLive = games.contains { $0.state == .live }
-            try? await Task.sleep(nanoseconds: UInt64(anyLive ? 20 : 120) * 1_000_000_000)
+            let wait = quickRefreshGame() != nil ? 10 : (anyLive ? 20 : 120)
+            try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
         }
+    }
+
+    /// In only-my-team mode, the favorite's game today if it's live or about to tip off.
+    private func quickRefreshGame() -> Game? {
+        guard Prefs.favoriteOnly, let g = favoriteGame(), games.contains(where: { $0.id == g.id }) else { return nil }
+        if g.state == .live { return g }
+        let untilTip = g.start.timeIntervalSinceNow
+        return g.state == .upcoming && untilTip < 5 * 60 && untilTip > -3 * 3600 ? g : nil
+    }
+
+    /// Restart the refresh loop so a new mode takes effect now rather than after its current sleep.
+    private func restartRefreshLoop() {
+        refreshTask?.cancel()
+        refreshTask = Task { await refreshLoop() }
     }
 
     private func lookaheadLoop() async {
@@ -455,7 +504,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func render() {
         ticker.speed = CGFloat(Prefs.speed)
         let list = visibleGames()
-        ticker.set(buildTickerSegments(list, favoriteID: Prefs.favoriteTeamID, font: font))
+        if Prefs.favoriteOnly, let fav = Prefs.favoriteTeamID {
+            if let g = favoriteGame() {
+                ticker.setCentered(buildTickerSegments([g], favoriteID: fav, font: font, separator: false)[0])
+            } else {
+                let name = (Prefs.favoriteTeamName ?? "your team").uppercased()
+                let msg = lookahead.isEmpty ? "LOADING \(name)…" : "NO UPCOMING GAME FOR \(name)"
+                ticker.setCentered(NSAttributedString(string: msg, attributes: [.font: font, .foregroundColor: Palette.dim]))
+            }
+        } else {
+            ticker.set(buildTickerSegments(list, favoriteID: Prefs.favoriteTeamID, font: font))
+        }
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             print("--- render: \(list.count) games, lookahead days loaded: \(lookahead.filter { !$0.isEmpty }.count)")
             for g in list.prefix(200) {
@@ -475,6 +534,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ticker.needsLayout = true
         case .display:
             render()
+        case .favoriteOnly:
+            render()
+            restartRefreshLoop()
         case .favorite:
             favoriteNext = nil
             render()
@@ -512,6 +574,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         if let name = Prefs.favoriteTeamName {
             menu.addItem(withTitle: "★ Following \(name)", action: nil, keyEquivalent: "").isEnabled = false
+            menu.addItem(item("Show Only \(name)", #selector(toggleFavoriteOnly), checked: Prefs.favoriteOnly))
         }
         menu.addItem(.separator())
 
@@ -582,6 +645,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func openSettings() { settings.show() }
     @objc private func checkForUpdates() { Task { await updater.check(userInitiated: true) } }
     @objc private func showUpdate() { updater.promptToDownload() }
+    @objc private func toggleFavoriteOnly() {
+        Prefs.favoriteOnly.toggle()
+        settingChanged(.favoriteOnly)
+    }
     @objc private func toggleRankedOnly() { Prefs.rankedOnly.toggle(); render() }
     @objc private func toggleFinals() { Prefs.showFinals.toggle(); render() }
     @objc private func toggleUpcoming() { Prefs.showUpcoming.toggle(); render() }

@@ -8,6 +8,7 @@ A scrolling, LED-style men's college basketball score ticker for your Mac.
 
 - **Every Division I game.** Live scores, today's finals and upcoming tip times, with AP rankings next to ranked teams.
 - **Follow your favorite team.** Pick any of the 365 D1 teams. Its game always scrolls first, whether it's live, today's final, or a game a week away.
+- **Just your team, if you like.** Turn on **Show only my team's game** and the ticker holds that one game still in the center, updating the score every 10 seconds while it's live.
 - **Looks ahead.** Top 25 teams with no game today show their next game, up to 6 days out, so the ticker is never empty on an off night.
 - **AP Top 25 in the menu bar.** The full poll with records, plus a live-game count on the 🏀 icon.
 - **Your choice of display.** Top 25 games only, show or hide finals and upcoming games, three scroll speeds, top or bottom of the screen.

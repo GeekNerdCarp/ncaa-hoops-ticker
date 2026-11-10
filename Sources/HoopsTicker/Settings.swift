@@ -37,6 +37,12 @@ enum Prefs {
         set { d.set(newValue, forKey: "favoriteTeamName") }
     }
 
+    /// Show just the favorite team's game, centered and not scrolling.
+    static var favoriteOnly: Bool {
+        get { d.bool(forKey: "favoriteOnly") }
+        set { d.set(newValue, forKey: "favoriteOnly") }
+    }
+
     static var autoCheckUpdates: Bool {
         get { d.object(forKey: "autoCheckUpdates") as? Bool ?? true }
         set { d.set(newValue, forKey: "autoCheckUpdates") }
@@ -52,7 +58,7 @@ enum Prefs {
 
 // MARK: - Settings window
 
-enum SettingChange { case favorite, position, display }
+enum SettingChange { case favorite, favoriteOnly, position, display }
 
 @MainActor
 final class SettingsController: NSObject {
@@ -65,6 +71,7 @@ final class SettingsController: NSObject {
     private let rankedBox = NSButton(checkboxWithTitle: "Top 25 games only", target: nil, action: nil)
     private let finalsBox = NSButton(checkboxWithTitle: "Final scores", target: nil, action: nil)
     private let upcomingBox = NSButton(checkboxWithTitle: "Upcoming games", target: nil, action: nil)
+    private let favoriteOnlyBox = NSButton(checkboxWithTitle: "Show only my team's game", target: nil, action: nil)
     private let updatesBox = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
     private var centered = false
 
@@ -79,7 +86,7 @@ final class SettingsController: NSObject {
         speedPopup.addItems(withTitles: Prefs.speeds.map { $0.0 })
         teamPopup.addItem(withTitle: "Loading teams…")
         teamPopup.isEnabled = false
-        for c: NSControl in [teamPopup, positionPopup, speedPopup, rankedBox, finalsBox, upcomingBox, updatesBox] {
+        for c: NSControl in [teamPopup, favoriteOnlyBox, positionPopup, speedPopup, rankedBox, finalsBox, upcomingBox, updatesBox] {
             c.target = self
             c.action = #selector(changed(_:))
         }
@@ -88,6 +95,14 @@ final class SettingsController: NSObject {
             "Your team's game shows first in the ticker: live, today's final, or its next scheduled game, even if that's days away.")
         hint.font = .systemFont(ofSize: 11)
         hint.textColor = .secondaryLabelColor
+        let onlyHint = NSTextField(wrappingLabelWithString:
+            "Holds that one game still in the middle of the ticker and updates the score every 10 seconds while it's live.")
+        onlyHint.font = .systemFont(ofSize: 11)
+        onlyHint.textColor = .secondaryLabelColor
+        let onlyStack = NSStackView(views: [favoriteOnlyBox, onlyHint])
+        onlyStack.orientation = .vertical
+        onlyStack.alignment = .leading
+        onlyStack.spacing = 2
 
         let showStack = NSStackView(views: [rankedBox, finalsBox, upcomingBox])
         showStack.orientation = .vertical
@@ -98,6 +113,7 @@ final class SettingsController: NSObject {
         let grid = NSGridView(views: [
             [label("Follow your favorite team:"), teamPopup],
             [NSGridCell.emptyContentView, hint],
+            [NSGridCell.emptyContentView, onlyStack],
             [label("Position:"), positionPopup],
             [label("Scroll speed:"), speedPopup],
             [label("Show:"), showStack],
@@ -105,8 +121,8 @@ final class SettingsController: NSObject {
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
-        grid.row(at: 4).rowAlignment = .none
-        grid.row(at: 4).yPlacement = .top
+        grid.row(at: 5).rowAlignment = .none
+        grid.row(at: 5).yPlacement = .top
         grid.rowSpacing = 12
         grid.columnSpacing = 10
         grid.translatesAutoresizingMaskIntoConstraints = false
@@ -120,6 +136,7 @@ final class SettingsController: NSObject {
             grid.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             teamPopup.widthAnchor.constraint(equalToConstant: 280),
             hint.widthAnchor.constraint(equalToConstant: 280),
+            onlyHint.widthAnchor.constraint(equalToConstant: 280),
         ])
         window.contentView = content
         window.setContentSize(content.fittingSize)
@@ -147,6 +164,8 @@ final class SettingsController: NSObject {
             let idx = teamPopup.itemArray.firstIndex { ($0.representedObject as? String) == fav && fav != nil } ?? 0
             teamPopup.selectItem(at: idx)
         }
+        favoriteOnlyBox.state = Prefs.favoriteOnly ? .on : .off
+        favoriteOnlyBox.isEnabled = Prefs.favoriteTeamID != nil
         positionPopup.selectItem(at: Prefs.atTop ? 1 : 0)
         speedPopup.selectItem(at: Prefs.speeds.firstIndex { $0.1 == Prefs.speed } ?? 1)
         rankedBox.state = Prefs.rankedOnly ? .on : .off
@@ -169,7 +188,11 @@ final class SettingsController: NSObject {
             let id = item?.representedObject as? String
             Prefs.favoriteTeamID = id
             Prefs.favoriteTeamName = id == nil ? nil : item?.title
+            favoriteOnlyBox.isEnabled = id != nil
             onChange?(.favorite)
+        case favoriteOnlyBox:
+            Prefs.favoriteOnly = favoriteOnlyBox.state == .on
+            onChange?(.favoriteOnly)
         case positionPopup:
             Prefs.atTop = positionPopup.indexOfSelectedItem == 1
             onChange?(.position)

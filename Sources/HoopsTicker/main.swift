@@ -349,7 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var first = true
         while true {
             do {
-                games = try await ESPN.fetchBoard(daysFromNow: 0)
+                games = try await ESPN.fetchToday()
                 lastUpdate = Date()
                 lastError = nil
             } catch {
@@ -439,16 +439,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return list
     }
 
-    /// Favorite's game: today's (live > upcoming > final), else the soonest upcoming one.
+    /// Favorite's game: today's (live > upcoming > final), else its soonest upcoming game
+    /// from either the next few days' scoreboards or its season schedule.
     private func favoriteGame() -> Game? {
         guard let fav = Prefs.favoriteTeamID else { return nil }
         let today = games.filter { $0.involves(fav) }
         if let g = today.first(where: { $0.state == .live }) ?? today.first(where: { $0.state == .upcoming }) {
             return g
         }
-        let ahead = lookahead.joined().filter { $0.involves(fav) && $0.state == .upcoming }.min { $0.start < $1.start }
         if let f = today.first(where: { $0.state == .final }) { return f }
-        return ahead ?? favoriteNext
+        let candidates = lookahead.joined().filter { $0.involves(fav) } + [favoriteNext].compactMap { $0 }
+        return candidates.filter { $0.state == .upcoming }.min { $0.start < $1.start }
     }
 
     private func render() {
@@ -572,7 +573,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func refreshNow() {
         Task {
-            if let g = try? await ESPN.fetchBoard(daysFromNow: 0) { games = g; lastUpdate = Date(); lastError = nil }
+            if let g = try? await ESPN.fetchToday() { games = g; lastUpdate = Date(); lastError = nil }
             lookahead = await ESPN.fetchLookahead(days: lookaheadDays)
             await refreshFavoriteNext()
             render()

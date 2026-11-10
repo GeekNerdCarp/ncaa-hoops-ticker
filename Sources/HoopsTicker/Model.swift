@@ -153,15 +153,29 @@ enum ESPN {
         return try JSONDecoder().decode(T.self, from: data)
     }
 
-    /// One day's scoreboard. 0 = today, 1 = tomorrow, …
+    /// One day's scoreboard. -1 = yesterday, 0 = today, 1 = tomorrow, …
+    /// Always asks for a specific date: ESPN's undated scoreboard keeps showing
+    /// yesterday's games until well into the morning.
     static func fetchBoard(daysFromNow: Int) async throws -> [Game] {
-        var url = "\(base)/scoreboard?groups=50&limit=400"
-        if daysFromNow != 0 {
-            let day = Calendar.current.date(byAdding: .day, value: daysFromNow, to: Date())!
-            url += "&dates=\(dateParam.string(from: day))"
-        }
+        let day = Calendar.current.date(byAdding: .day, value: daysFromNow, to: Date())!
+        let url = "\(base)/scoreboard?groups=50&limit=400&dates=\(dateParam.string(from: day))"
         let board = try await get(Board.self, url)
         return board.events.compactMap { $0.value }.compactMap(makeGame)
+    }
+
+    /// What the ticker treats as "today": all of today's games, plus yesterday's games
+    /// that are still going or haven't tipped off (late games run past midnight), plus,
+    /// before noon, last night's final scores.
+    static func fetchToday() async throws -> [Game] {
+        async let todayBoard = fetchBoard(daysFromNow: 0)
+        async let yesterdayBoard = try? fetchBoard(daysFromNow: -1)
+        var games = try await todayBoard
+        let morning = Calendar.current.component(.hour, from: Date()) < 12
+        for g in await yesterdayBoard ?? [] where g.state != .final || morning {
+            games.append(g)
+        }
+        var seen = Set<String>()
+        return games.filter { seen.insert($0.id).inserted }
     }
 
     /// Days 1...n, fetched in parallel. Index 0 = tomorrow. A failed day comes back empty.

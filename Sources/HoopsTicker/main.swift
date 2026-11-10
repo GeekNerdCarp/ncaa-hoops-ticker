@@ -104,6 +104,39 @@ final class TickerView: NSView {
     }
 }
 
+// MARK: - Menu bar icon
+
+/// The app icon's basketball, drawn as a vector so it stays sharp at menu bar size.
+func menuBarBall() -> NSImage {
+    let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { rect in
+        let ball = NSBezierPath(ovalIn: rect.insetBy(dx: 1, dy: 1))
+        NSGradient(colors: [NSColor(calibratedRed: 1, green: 0.67, blue: 0.35, alpha: 1),
+                            NSColor(calibratedRed: 0.94, green: 0.45, blue: 0.14, alpha: 1),
+                            NSColor(calibratedRed: 0.75, green: 0.27, blue: 0.08, alpha: 1)],
+                   atLocations: [0, 0.55, 1], colorSpace: .deviceRGB)!
+            .draw(in: ball, relativeCenterPosition: NSPoint(x: -0.35, y: 0.4))
+
+        NSGraphicsContext.saveGraphicsState()
+        ball.addClip()
+        NSColor(calibratedRed: 0.16, green: 0.07, blue: 0.04, alpha: 1).setStroke()
+        let c = NSPoint(x: rect.midX, y: rect.midY)
+        let r = rect.width / 2 - 1
+        let seams = NSBezierPath()
+        seams.move(to: NSPoint(x: c.x, y: c.y - r)); seams.line(to: NSPoint(x: c.x, y: c.y + r))
+        seams.move(to: NSPoint(x: c.x - r, y: c.y)); seams.line(to: NSPoint(x: c.x + r, y: c.y))
+        for side: CGFloat in [-1, 1] {
+            let rr = r * 0.95, cx = c.x + side * r * 1.2
+            seams.appendOval(in: NSRect(x: cx - rr, y: c.y - rr, width: 2 * rr, height: 2 * rr))
+        }
+        seams.lineWidth = 1.1
+        seams.stroke()
+        NSGraphicsContext.restoreGraphicsState()
+        return true
+    }
+    img.accessibilityDescription = "Hoops Ticker"
+    return img
+}
+
 // MARK: - App delegate
 
 @MainActor
@@ -140,7 +173,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.contentView = ticker
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "🏀"
+        statusItem.button?.image = menuBarBall()
+        statusItem.button?.imagePosition = .imageLeading
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -293,7 +327,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             fflush(stdout)
         }
         let live = games.filter { $0.state == .live }.count
-        statusItem.button?.title = live > 0 ? "🏀 \(live)" : "🏀"
+        statusItem.button?.title = live > 0 ? " \(live)" : ""
         settings.sync()
     }
 

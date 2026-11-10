@@ -37,6 +37,16 @@ enum Prefs {
         set { d.set(newValue, forKey: "favoriteTeamName") }
     }
 
+    static var autoCheckUpdates: Bool {
+        get { d.object(forKey: "autoCheckUpdates") as? Bool ?? true }
+        set { d.set(newValue, forKey: "autoCheckUpdates") }
+    }
+    /// The newest version we've already told the user about, so automatic checks don't nag.
+    static var lastPromptedVersion: String? {
+        get { d.string(forKey: "lastPromptedVersion") }
+        set { d.set(newValue, forKey: "lastPromptedVersion") }
+    }
+
     static let speeds: [(String, Double)] = [("Slow", 1.0), ("Medium", 2.0), ("Fast", 3.5)]
 }
 
@@ -55,6 +65,7 @@ final class SettingsController: NSObject {
     private let rankedBox = NSButton(checkboxWithTitle: "Top 25 games only", target: nil, action: nil)
     private let finalsBox = NSButton(checkboxWithTitle: "Final scores", target: nil, action: nil)
     private let upcomingBox = NSButton(checkboxWithTitle: "Upcoming games", target: nil, action: nil)
+    private let updatesBox = NSButton(checkboxWithTitle: "Check for updates automatically", target: nil, action: nil)
     private var centered = false
 
     override init() {
@@ -68,7 +79,7 @@ final class SettingsController: NSObject {
         speedPopup.addItems(withTitles: Prefs.speeds.map { $0.0 })
         teamPopup.addItem(withTitle: "Loading teams…")
         teamPopup.isEnabled = false
-        for c: NSControl in [teamPopup, positionPopup, speedPopup, rankedBox, finalsBox, upcomingBox] {
+        for c: NSControl in [teamPopup, positionPopup, speedPopup, rankedBox, finalsBox, upcomingBox, updatesBox] {
             c.target = self
             c.action = #selector(changed(_:))
         }
@@ -90,6 +101,7 @@ final class SettingsController: NSObject {
             [label("Position:"), positionPopup],
             [label("Scroll speed:"), speedPopup],
             [label("Show:"), showStack],
+            [label("Updates:"), updatesBox],
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
@@ -140,6 +152,7 @@ final class SettingsController: NSObject {
         rankedBox.state = Prefs.rankedOnly ? .on : .off
         finalsBox.state = Prefs.showFinals ? .on : .off
         upcomingBox.state = Prefs.showUpcoming ? .on : .off
+        updatesBox.state = Prefs.autoCheckUpdates ? .on : .off
     }
 
     func show() {
@@ -172,6 +185,8 @@ final class SettingsController: NSObject {
         case upcomingBox:
             Prefs.showUpcoming = upcomingBox.state == .on
             onChange?(.display)
+        case updatesBox:
+            Prefs.autoCheckUpdates = updatesBox.state == .on
         default:
             break
         }

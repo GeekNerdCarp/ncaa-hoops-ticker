@@ -276,6 +276,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var ticker: TickerView!
     private var statusItem: NSStatusItem!
     private let settings = SettingsController()
+    private let updater = Updater()
 
     private var games: [Game] = []          // today
     private var lookahead: [[Game]] = []    // tomorrow onward, one array per day
@@ -323,8 +324,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { await lookaheadLoop() }
         Task { await top25Loop() }
         Task { await loadTeams() }
+        updater.startAutomaticChecks()
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.settings.show() }
+        }
+        if ProcessInfo.processInfo.environment["HOOPS_CHECK_NOW"] != nil {   // test the manual check path
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.checkForUpdates() }
         }
     }
 
@@ -486,6 +491,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        if let a = updater.available {
+            let it = item("Update Available: Version \(a.version)…", #selector(showUpdate))
+            it.attributedTitle = NSAttributedString(string: it.title,
+                                                    attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
+            menu.addItem(it)
+            menu.addItem(.separator())
+        }
+
         let live = games.filter { $0.state == .live }.count
         let up = games.filter { $0.state == .upcoming }.count
         let fin = games.filter { $0.state == .final }.count
@@ -504,6 +517,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item(panel.isVisible ? "Hide Ticker" : "Show Ticker", #selector(toggleTicker)))
         menu.addItem(item("Refresh Now", #selector(refreshNow)))
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
+        menu.addItem(item("Check for Updates…", #selector(checkForUpdates)))
         menu.addItem(.separator())
 
         menu.addItem(item("Top 25 Games Only", #selector(toggleRankedOnly), checked: Prefs.rankedOnly))
@@ -565,6 +579,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     @objc private func openSettings() { settings.show() }
+    @objc private func checkForUpdates() { Task { await updater.check(userInitiated: true) } }
+    @objc private func showUpdate() { updater.promptToDownload() }
     @objc private func toggleRankedOnly() { Prefs.rankedOnly.toggle(); render() }
     @objc private func toggleFinals() { Prefs.showFinals.toggle(); render() }
     @objc private func toggleUpcoming() { Prefs.showUpcoming.toggle(); render() }

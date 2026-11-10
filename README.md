@@ -29,8 +29,13 @@ Click 🏀 in the menu bar for:
 - **Hide / Show Ticker**
 - **AP Top 25**
 - **Refresh Now**
+- **Check for Updates…**
 
 You can also right-click the ticker to open the same menu.
+
+## Updates
+
+Hoops Ticker checks this repository's latest GitHub release shortly after it launches and once a day. When a newer version is out, it tells you what's new and offers to download the DMG; the menu also shows **Update Available**. It only reads the public release information and sends nothing about you. You can turn automatic checks off in Settings and use **Check for Updates…** whenever you like.
 
 ## Build from source
 

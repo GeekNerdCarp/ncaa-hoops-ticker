@@ -10,20 +10,81 @@ enum Palette {
     static let score = NSColor(calibratedWhite: 0.92, alpha: 1)
     static let live = NSColor(calibratedRed: 1.0, green: 0.38, blue: 0.3, alpha: 1)
     static let upcoming = NSColor(calibratedRed: 0.4, green: 0.85, blue: 1.0, alpha: 1)
-    static let final = NSColor(calibratedWhite: 0.6, alpha: 1)
-    static let dim = NSColor(calibratedWhite: 0.4, alpha: 1)
+    static let final = NSColor(calibratedWhite: 1, alpha: 0.62)   // see-through, so it suits team-colored bars too
+    static let dim = NSColor(calibratedWhite: 1, alpha: 0.45)
+    static let network = NSColor(calibratedWhite: 0.72, alpha: 1)
+    static let alert = NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.2, alpha: 1)
+}
+
+extension NSColor {
+    convenience init?(hex: String?) {
+        guard let hex, hex.count == 6, let v = UInt32(hex, radix: 16) else { return nil }
+        self.init(srgbRed: CGFloat((v >> 16) & 0xff) / 255, green: CGFloat((v >> 8) & 0xff) / 255,
+                  blue: CGFloat(v & 0xff) / 255, alpha: 1)
+    }
+    /// WCAG relative luminance, 0 (black) to 1 (white).
+    var luminance: CGFloat {
+        guard let c = usingColorSpace(.sRGB) else { return 0 }
+        func lin(_ v: CGFloat) -> CGFloat { v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4) }
+        return 0.2126 * lin(c.redComponent) + 0.7152 * lin(c.greenComponent) + 0.0722 * lin(c.blueComponent)
+    }
+}
+
+/// A team's bar colors: the primary color, darkened if needed so white and gold text stay
+/// readable, and an accent stripe from the second color (or the primary when that's too dark).
+func teamBarColors(primary: String?, alternate: String?) -> (background: NSColor, accent: NSColor)? {
+    guard let base = NSColor(hex: primary) else { return nil }
+    var bg = base
+    var step: CGFloat = 0
+    while bg.luminance > 0.12 && step < 0.9 {
+        step += 0.05
+        bg = base.blended(withFraction: step, of: .black) ?? base
+    }
+    var accent = NSColor(hex: alternate) ?? .white
+    if accent.luminance < 0.1 || abs(accent.luminance - bg.luminance) < 0.05 { accent = base.luminance > 0.1 ? base : .white }
+    return (bg, accent)
+}
+
+/// Whether a live game's change between two refreshes deserves a glow.
+/// mode: 0 off, 1 the favorite team scored, 2 big moments, 3 any score change.
+func shouldFlash(prev: Game, now: Game, mode: Int, followed: Set<String>) -> Bool {
+    func pts(_ s: Side) -> Int? { Int(s.score ?? "") }
+    guard let pa = pts(prev.away), let ph = pts(prev.home), let na = pts(now.away), let nh = pts(now.home),
+          (pa, ph) != (na, nh) else { return false }
+    switch mode {
+    case 1:
+        return (followed.contains(now.away.teamID) && na > pa) || (followed.contains(now.home.teamID) && nh > ph)
+    case 2:
+        let before = pa - ph, after = na - nh
+        let leadChange = before != 0 && after != 0 && (before > 0) != (after > 0)
+        let tie = after == 0 && before != 0
+        func late(_ g: Game) -> Bool { g.period >= 2 && g.clock <= 240 && !g.isHalftime }
+        let onePossession = late(now) && abs(after) <= 3 && (abs(before) > 3 || !late(prev))
+        return leadChange || tie || onePossession
+    case 3:
+        return true
+    default:
+        return false
+    }
 }
 
 /// One attributed string per game (separator included), so the ticker only draws what's on screen.
-func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont, separator: Bool = true) -> [NSAttributedString] {
+@MainActor
+func buildTickerSegments(_ games: [Game], followed: Set<String>, font: NSFont, separator: Bool = true) -> [NSAttributedString] {
     var out = NSMutableAttributedString()
     var parts: [NSAttributedString] = []
     func add(_ s: String, _ c: NSColor) {
         out.append(NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: c]))
     }
     func team(_ s: Side, showScore: Bool, live: Bool) {
+        if Prefs.showLogos, let logo = LogoStore.shared.attachment(for: s.teamID, font: font) {
+            out.append(NSAttributedString(attachment: logo))
+            add(" ", Palette.dim)
+        }
         if let r = s.rank { add("#\(r) ", Palette.rank) }
-        add(s.name.uppercased(), s.teamID == favoriteID ? Palette.favorite : Palette.name)
+        else if let seed = s.seed { add("(\(seed)) ", Palette.rank) }
+        add(s.name.uppercased(), followed.contains(s.teamID) ? Palette.favorite : Palette.name)
+        if Prefs.showRecords, let rec = s.record, !rec.isEmpty { add(" (\(rec))", Palette.dim) }
         if showScore, let sc = s.score { add(" \(sc)", live ? Palette.liveScore : Palette.score) }
     }
 
@@ -33,23 +94,36 @@ func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont, sep
         return [out]
     }
     for g in games {
-        if let fav = favoriteID, g.involves(fav) { add("★ ", Palette.favorite) }
+        let mine = followed.contains(g.away.teamID) || followed.contains(g.home.teamID)
+        if mine { add("★ ", Palette.favorite) }
+        if Prefs.showAlertTags, let tag = g.isUpsetBrewing ? "UPSET ALERT" : (g.isCloseLate ? "CLOSE" : nil) {
+            // White on red, so it reads as a badge rather than more ticker text.
+            out.append(NSAttributedString(string: " \(tag) ", attributes: [.font: font, .foregroundColor: NSColor.white,
+                                                                          .backgroundColor: Palette.alert]))
+            add("  ", Palette.dim)
+        }
         switch g.state {
         case .live:
             team(g.away, showScore: true, live: true)
             add("  –  ", Palette.dim)
             team(g.home, showScore: true, live: true)
             add("   \(g.detail.uppercased())", Palette.live)
+            if let r = g.round { add(" · \(r)", Palette.rank) }
+            // Where to watch your own team's game while it's on.
+            if mine, let n = g.network { add(" · \(n.uppercased())", Palette.network) }
         case .final:
             team(g.away, showScore: true, live: false)
             add("  –  ", Palette.dim)
             team(g.home, showScore: true, live: false)
             add("   \(g.detail.uppercased())", Palette.final)
+            if let r = g.round { add(" · \(r)", Palette.rank) }
         case .upcoming:
             team(g.away, showScore: false, live: false)
             add("  @  ", Palette.dim)
             team(g.home, showScore: false, live: false)
             add("   \(g.detail.uppercased())", Palette.upcoming)
+            if let r = g.round { add(" · \(r)", Palette.rank) }
+            if let n = g.network { add(" · \(n.uppercased())", Palette.network) }
         }
         if separator { add("      ◆      ", Palette.dim) }
         parts.append(out)
@@ -73,6 +147,16 @@ final class TickerView: NSView {
     private var images: [Int: CGImage] = [:]          // segment -> rendered image
     private var tick: Timer?
     private var centered = false   // one still segment in the middle instead of scrolling
+    private var background = NSColor.black
+    private var accentHeight: CGFloat = 1
+    private var downAt: NSPoint?
+    private var keys: [String] = []               // game id for each segment ("" for messages)
+    private var pendingFlash = Set<String>()      // games whose score changed, waiting to be on screen
+    private var hand = false
+    private var paused = false
+
+    /// Called with the index of the segment that was clicked.
+    var onClick: ((Int) -> Void)?
 
     /// Points per frame at 60 fps (kept from the original timer-based ticker).
     var speed: CGFloat = 2.0 {
@@ -96,7 +180,8 @@ final class TickerView: NSView {
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func set(_ parts: [NSAttributedString]) {
+    func set(_ parts: [NSAttributedString], keys: [String] = []) {
+        self.keys = keys
         // Refreshes usually change nothing; skip the rebuild so scrolling isn't disturbed.
         guard parts != lastParts || centered else { return }
         let wasCentered = centered
@@ -115,7 +200,8 @@ final class TickerView: NSView {
     }
 
     /// Shows one segment, still and centered. Unchanged text costs nothing.
-    func setCentered(_ text: NSAttributedString) {
+    func setCentered(_ text: NSAttributedString, key: String = "") {
+        keys = [key]
         guard !centered || segments.first?.text != text else { return }
         centered = true
         lastParts = []
@@ -126,12 +212,30 @@ final class TickerView: NSView {
         restart(at: 0)
     }
 
+    /// Bar colors: black with a thin grey line normally, or a team's colors.
+    func setColors(background bg: NSColor, accent: NSColor, accentHeight h: CGFloat) {
+        guard bg != background || accent.cgColor != self.accent.backgroundColor || h != accentHeight else { return }
+        background = bg
+        accentHeight = h
+        layer!.backgroundColor = bg.cgColor
+        self.accent.backgroundColor = accent.cgColor
+        needsLayout = true
+        clearLayers()   // segment images have the old background baked in
+        updateVisible()
+    }
+
+    /// Glow these games once each, as soon as they're on screen (now, if they already are).
+    func flash(_ ids: Set<String>) {
+        pendingFlash.formUnion(ids.subtracting([""]))
+        updateVisible()
+    }
+
     /// Jump back so the first game is at the left edge.
     func resetToStart() { restart(at: 0) }
 
     override func layout() {
         super.layout()
-        accent.frame = CGRect(x: 0, y: Prefs.atTop ? 0 : bounds.height - 1, width: bounds.width, height: 1)
+        accent.frame = CGRect(x: 0, y: Prefs.atTop ? 0 : bounds.height - accentHeight, width: bounds.width, height: accentHeight)
         if centered { restart(at: 0) }
     }
 
@@ -149,6 +253,54 @@ final class TickerView: NSView {
         updateVisible()
     }
 
+    // MARK: Clicks
+
+    // The panel never becomes active, so take the very first click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    override func mouseDown(with event: NSEvent) { downAt = convert(event.locationInWindow, from: nil) }
+
+    override func mouseUp(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        defer { downAt = nil }
+        guard let d = downAt, hypot(p.x - d.x, p.y - d.y) < 6, let i = segmentIndex(at: p.x) else { return }
+        onClick?(i)
+    }
+
+    /// Which segment is under this x position right now (the strip may be mid-scroll).
+    private func segmentIndex(at x: CGFloat) -> Int? {
+        guard total > 0 else { return nil }
+        let sx = x - (strip.presentation() ?? strip).position.x
+        if centered { return sx >= 0 && sx < total ? 0 : nil }
+        var o = sx.truncatingRemainder(dividingBy: total)
+        if o < 0 { o += total }
+        return segments.firstIndex { o >= $0.x && o < $0.x + $0.width }
+    }
+
+    // Pointing-hand cursor over the ticker, even though the app is never frontmost.
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        trackingAreas.forEach(removeTrackingArea)
+        addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
+                                       owner: self, userInfo: nil))
+    }
+    override func mouseEntered(with event: NSEvent) {
+        if !hand { NSCursor.pointingHand.push(); hand = true }
+        if Prefs.pauseOnHover { setPaused(true) }
+    }
+    override func mouseExited(with event: NSEvent) {
+        if hand { NSCursor.pop(); hand = false }
+        setPaused(false)
+    }
+
+    /// Hold the strip where it is (so a score can be read), or carry on from there.
+    private func setPaused(_ p: Bool) {
+        guard p != paused else { return }
+        let here = currentOffset()
+        paused = p
+        restart(at: here)
+    }
+
     // MARK: Scrolling
 
     private func currentOffset() -> CGFloat {
@@ -164,7 +316,7 @@ final class TickerView: NSView {
         CATransaction.setDisableActions(true)
         strip.position = CGPoint(x: centered ? ((bounds.width - total) / 2).rounded() : -offset, y: 0)
         CATransaction.commit()
-        if centered { updateVisible(offset: 0); return }
+        if centered || paused { updateVisible(offset: offset); return }
         let pointsPerSecond = speed * 60
         if total > 0, pointsPerSecond > 0 {
             let anim = CABasicAnimation(keyPath: "position.x")
@@ -226,9 +378,44 @@ final class TickerView: NSView {
             l.removeFromSuperlayer()
             liveLayers[key] = nil
         }
+        if !pendingFlash.isEmpty { flashVisible(offset: off) }
         CATransaction.commit()
         let inUse = Set(liveLayers.keys.compactMap { Int($0.split(separator: ":")[0]) })
         images = images.filter { inUse.contains($0.key) }
+    }
+
+    /// Pulse a highlight over any pending game that has scrolled well into view.
+    private func flashVisible(offset off: CGFloat) {
+        let viewLeft = centered ? -CGFloat.infinity : off
+        let viewRight = centered ? CGFloat.infinity : off + bounds.width
+        var done = Set<String>()
+        for (key, l) in liveLayers {
+            guard let i = Int(key.split(separator: ":")[0]), keys.indices.contains(i),
+                  pendingFlash.contains(keys[i]) else { continue }
+            // The layer's x is in strip coordinates, the same space as the offset.
+            // Wait until most of the game is on screen, so the glow is seen.
+            let x = l.frame.minX, need = min(l.frame.width, bounds.width) * 0.75
+            guard x + l.frame.width >= viewLeft + need, x <= viewRight - need else { continue }
+            let glow = CALayer()
+            glow.frame = l.bounds.insetBy(dx: 2, dy: 4)
+            glow.cornerRadius = 6
+            glow.backgroundColor = Palette.liveScore.withAlphaComponent(0.22).cgColor
+            glow.borderColor = Palette.liveScore.withAlphaComponent(0.55).cgColor
+            glow.borderWidth = 1.5
+            glow.opacity = 0
+            l.addSublayer(glow)
+            // One soft fade in and out.
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [0, 1, 1, 0]
+            fade.keyTimes = [0, 0.3, 0.5, 1]
+            fade.duration = 2.2
+            fade.timingFunctions = [CAMediaTimingFunction(name: .easeOut), CAMediaTimingFunction(name: .linear),
+                                    CAMediaTimingFunction(name: .easeInEaseOut)]
+            glow.add(fade, forKey: "flash")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2.4) { glow.removeFromSuperlayer() }
+            done.insert(keys[i])
+        }
+        pendingFlash.subtract(done)
     }
 
     private func image(for i: Int, scale: CGFloat, height: CGFloat) -> CGImage? {
@@ -240,7 +427,7 @@ final class TickerView: NSView {
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
         ctx.scaleBy(x: scale, y: scale)
-        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.setFillColor(background.cgColor)
         ctx.fill(CGRect(x: 0, y: 0, width: s.width, height: height))
         // AppKit string drawing honors the NSColor attributes (Core Text's CTLineDraw ignores them).
         NSGraphicsContext.saveGraphicsState()
@@ -295,14 +482,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let settings = SettingsController()
     private let updater = Updater()
+    private let alerts = TeamAlerts()
 
     private var games: [Game] = []          // today
     private var lookahead: [[Game]] = []    // tomorrow onward, one array per day
-    private var favoriteNext: Game?         // favorite team's next game from its season schedule
+    private var scheduleNext: [String: Game] = [:]   // each followed team's next game, from its season schedule
     private var top25: [RankedTeam] = []
     private var lastUpdate: Date?
     private var lastError: String?
     private var refreshTask: Task<Void, Never>?
+    private var shownGames: [Game] = []     // what each ticker segment is, for clicks
+    private var teamColors: [String: (String?, String?)] = [:]   // team id -> (primary, alternate) hex
+    private var lastLive: [String: Game] = [:]   // previous snapshot of each live game, to spot baskets
     private var lastFullRefresh = Date.distantPast
 
     private let lookaheadDays = 6
@@ -331,6 +522,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         ticker.menu = menu
+        ticker.onClick = { [weak self] i in self?.openGame(at: i) }
+        LogoStore.shared.onLoad = { [weak self] in self?.render() }
 
         settings.onChange = { [weak self] change in self?.settingChanged(change) }
 
@@ -344,7 +537,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Task { await lookaheadLoop() }
         Task { await top25Loop() }
         Task { await loadTeams() }
+        Task { await loadConferences() }
         updater.startAutomaticChecks()
+        alerts.start()
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.settings.show() }
         }
@@ -356,7 +551,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Layout
 
     @objc private func layoutPanel() {
-        guard let screen = NSScreen.main else { return }
+        guard let screen = Displays.target else { return }
+        settings.syncDisplays()   // monitors may have just been plugged in or removed
         let vf = screen.visibleFrame
         let y = Prefs.atTop ? vf.maxY - barHeight : vf.minY
         panel.setFrame(NSRect(x: screen.frame.minX, y: y, width: screen.frame.width, height: barHeight), display: true)
@@ -380,7 +576,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             } else {
                 do {
-                    games = try await ESPN.fetchToday()
+                    games = try await ESPN.fetchToday(group: Prefs.conferenceID ?? 50, alsoTeams: Set(Prefs.followedIDs))
                     lastUpdate = Date()
                     lastFullRefresh = Date()
                     lastError = nil
@@ -389,12 +585,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
             guard !Task.isCancelled else { return }
+            for fav in Prefs.followedIDs {
+                for g in games where g.involves(fav) { alerts.observe(g, favoriteID: fav) }
+            }
             render()
+            ticker.flash(scoreChanges())
             if first, !games.isEmpty { ticker.resetToStart(); first = false }
             let anyLive = games.contains { $0.state == .live }
             let wait = quickRefreshGame() != nil ? 10 : (anyLive ? 20 : 120)
             try? await Task.sleep(nanoseconds: UInt64(wait) * 1_000_000_000)
         }
+    }
+
+    /// Live games that should glow this refresh, per the "Flash score changes" setting.
+    private func scoreChanges() -> Set<String> {
+        var out = Set<String>()
+        for g in games where g.state == .live {
+            if let prev = lastLive[g.id],
+               shouldFlash(prev: prev, now: g, mode: Prefs.flashMode, followed: Set(Prefs.followedIDs)) {
+                out.insert(g.id)
+            }
+            lastLive[g.id] = g
+        }
+        return out
     }
 
     /// In only-my-team mode, the favorite's game today if it's live or about to tip off.
@@ -403,6 +616,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if g.state == .live { return g }
         let untilTip = g.start.timeIntervalSinceNow
         return g.state == .upcoming && untilTip < 5 * 60 && untilTip > -3 * 3600 ? g : nil
+    }
+
+    /// The conference changed: fetch today and the days ahead again and start from the left.
+    private func reloadEverything() {
+        restartRefreshLoop()
+        Task {
+            lookahead = await ESPN.fetchLookahead(days: lookaheadDays, group: Prefs.conferenceID ?? 50)
+            render()
+            ticker.resetToStart()
+        }
     }
 
     /// Restart the refresh loop so a new mode takes effect now rather than after its current sleep.
@@ -414,8 +637,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func lookaheadLoop() async {
         var first = true
         while true {
-            lookahead = await ESPN.fetchLookahead(days: lookaheadDays)
-            await refreshFavoriteNext()
+            lookahead = await ESPN.fetchLookahead(days: lookaheadDays, group: Prefs.conferenceID ?? 50)
+            await refreshScheduleNext()
             render()
             // On launch, a favorite that isn't playing today only appears once lookahead arrives.
             if first, Prefs.favoriteTeamID != nil { ticker.resetToStart() }
@@ -424,9 +647,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
-    private func refreshFavoriteNext() async {
-        guard let fav = Prefs.favoriteTeamID else { favoriteNext = nil; return }
-        favoriteNext = try? await ESPN.fetchNextGame(teamID: fav)
+    private func refreshScheduleNext() async {
+        var out: [String: Game] = [:]
+        for id in Prefs.followedIDs { if let g = try? await ESPN.fetchNextGame(teamID: id) { out[id] = g } }
+        scheduleNext = out
     }
 
     private func top25Loop() async {
@@ -436,10 +660,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
 
+    private func loadConferences() async {
+        for attempt in 0..<5 {
+            if let c = try? await ESPN.fetchConferences(), !c.isEmpty { settings.setConferences(c); return }
+            try? await Task.sleep(nanoseconds: UInt64(10 + attempt * 20) * 1_000_000_000)
+        }
+    }
+
     private func loadTeams() async {
         for attempt in 0..<5 {
             if let t = try? await ESPN.fetchTeams(), !t.isEmpty {
                 settings.setTeams(t)
+                for team in t { teamColors[team.id] = (team.color, team.altColor) }
+                render()
                 return
             }
             try? await Task.sleep(nanoseconds: UInt64(10 + attempt * 20) * 1_000_000_000)
@@ -473,47 +706,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
-        func order(_ s: GameState) -> Int { s == .live ? 0 : (s == .upcoming ? 1 : 2) }
+        // Upsets brewing, then close finishes, then other live games, upcoming, finals.
+        func order(_ g: Game) -> Int {
+            switch g.state {
+            case .live:
+                guard Prefs.showAlertTags else { return 2 }
+                return g.isUpsetBrewing ? 0 : (g.isCloseLate ? 1 : 2)
+            case .upcoming: return 3
+            case .final: return 4
+            }
+        }
         list.sort {
-            if order($0.state) != order($1.state) { return order($0.state) < order($1.state) }
+            if order($0) != order($1) { return order($0) < order($1) }
             if $0.state == .upcoming, $0.start != $1.start { return $0.start < $1.start }
             if $0.bestRank != $1.bestRank { return $0.bestRank < $1.bestRank }
             return $0.start < $1.start
         }
 
-        if let fav = favoriteGame() {
-            list.removeAll { $0.id == fav.id }
-            list.insert(fav, at: 0)
+        // Followed teams lead, in the order you picked them: favorite first, then the others.
+        var lead: [Game] = []
+        for id in Prefs.followedIDs {
+            if let g = followedGame(id), !lead.contains(where: { $0.id == g.id }) { lead.append(g) }
         }
-        return list
+        list.removeAll { g in lead.contains { $0.id == g.id } }
+        return lead + list
     }
 
     /// Favorite's game: today's (live > upcoming > final), else its soonest upcoming game
     /// from either the next few days' scoreboards or its season schedule.
     private func favoriteGame() -> Game? {
         guard let fav = Prefs.favoriteTeamID else { return nil }
+        return followedGame(fav)
+    }
+
+    private func followedGame(_ fav: String) -> Game? {
         let today = games.filter { $0.involves(fav) }
         if let g = today.first(where: { $0.state == .live }) ?? today.first(where: { $0.state == .upcoming }) {
             return g
         }
         if let f = today.first(where: { $0.state == .final }) { return f }
-        let candidates = lookahead.joined().filter { $0.involves(fav) } + [favoriteNext].compactMap { $0 }
+        let candidates = lookahead.joined().filter { $0.involves(fav) } + [scheduleNext[fav]].compactMap { $0 }
         return candidates.filter { $0.state == .upcoming }.min { $0.start < $1.start }
     }
 
     private func render() {
         ticker.speed = CGFloat(Prefs.speed)
         let list = visibleGames()
+        shownGames = list
+        let defaultAccent = NSColor(calibratedWhite: 0.25, alpha: 1)
+        if Prefs.favoriteOnly, Prefs.useTeamColors, let fav = Prefs.favoriteTeamID,
+           let c = teamColors[fav], let bar = teamBarColors(primary: c.0, alternate: c.1) {
+            ticker.setColors(background: bar.background, accent: bar.accent, accentHeight: 3)
+        } else {
+            ticker.setColors(background: .black, accent: defaultAccent, accentHeight: 1)
+        }
         if Prefs.favoriteOnly, let fav = Prefs.favoriteTeamID {
+            shownGames = []
             if let g = favoriteGame() {
-                ticker.setCentered(buildTickerSegments([g], favoriteID: fav, font: font, separator: false)[0])
+                shownGames = [g]
+                ticker.setCentered(buildTickerSegments([g], followed: Set(Prefs.followedIDs), font: font, separator: false)[0], key: g.id)
             } else {
                 let name = (Prefs.favoriteTeamName ?? "your team").uppercased()
                 let msg = lookahead.isEmpty ? "LOADING \(name)…" : "NO UPCOMING GAME FOR \(name)"
                 ticker.setCentered(NSAttributedString(string: msg, attributes: [.font: font, .foregroundColor: Palette.dim]))
             }
         } else {
-            ticker.set(buildTickerSegments(list, favoriteID: Prefs.favoriteTeamID, font: font))
+            ticker.set(buildTickerSegments(list, followed: Set(Prefs.followedIDs), font: font), keys: list.map { $0.id })
         }
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             print("--- render: \(list.count) games, lookahead days loaded: \(lookahead.filter { !$0.isEmpty }.count)")
@@ -527,6 +785,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         settings.sync()
     }
 
+    /// Open ESPN's page for the clicked game: live gamecast, box score, or preview.
+    private func openGame(at i: Int) {
+        guard shownGames.indices.contains(i),
+              let url = URL(string: "https://www.espn.com/mens-college-basketball/game/_/gameId/\(shownGames[i].id)") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
     private func settingChanged(_ change: SettingChange) {
         switch change {
         case .position:
@@ -537,15 +802,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         case .favoriteOnly:
             render()
             restartRefreshLoop()
-        case .favorite:
-            favoriteNext = nil
+        case .favorite, .followed:
+            scheduleNext = scheduleNext.filter { Prefs.followedIDs.contains($0.key) }
             render()
             ticker.resetToStart()
             Task {
-                await refreshFavoriteNext()
+                await refreshScheduleNext()
                 render()
                 ticker.resetToStart()
             }
+            restartRefreshLoop()   // the "also show followed teams' games" fetch depends on who's followed
+        case .conference:
+            reloadEverything()
         }
     }
 
@@ -573,7 +841,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(withTitle: "Updated \(f.string(from: t))", action: nil, keyEquivalent: "").isEnabled = false
         }
         if let name = Prefs.favoriteTeamName {
-            menu.addItem(withTitle: "★ Following \(name)", action: nil, keyEquivalent: "").isEnabled = false
+            let more = Prefs.extraTeamIDs.filter { $0 != Prefs.favoriteTeamID }.count
+            menu.addItem(withTitle: "★ Following \(name)" + (more > 0 ? " + \(more) more" : ""), action: nil, keyEquivalent: "").isEnabled = false
             menu.addItem(item("Show Only \(name)", #selector(toggleFavoriteOnly), checked: Prefs.favoriteOnly))
         }
         menu.addItem(.separator())
@@ -636,9 +905,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc private func refreshNow() {
         Task {
-            if let g = try? await ESPN.fetchToday() { games = g; lastUpdate = Date(); lastError = nil }
-            lookahead = await ESPN.fetchLookahead(days: lookaheadDays)
-            await refreshFavoriteNext()
+            if let g = try? await ESPN.fetchToday(group: Prefs.conferenceID ?? 50, alsoTeams: Set(Prefs.followedIDs)) {
+                games = g; lastUpdate = Date(); lastError = nil
+            }
+            lookahead = await ESPN.fetchLookahead(days: lookaheadDays, group: Prefs.conferenceID ?? 50)
+            await refreshScheduleNext()
             render()
         }
     }

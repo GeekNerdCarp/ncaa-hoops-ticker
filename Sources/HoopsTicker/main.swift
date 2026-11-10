@@ -487,7 +487,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var games: [Game] = []          // today
     private var lookahead: [[Game]] = []    // tomorrow onward, one array per day
     private var scheduleNext: [String: Game] = [:]   // each followed team's next game, from its season schedule
-    private var top25: [RankedTeam] = []
     private var lastUpdate: Date?
     private var lastError: String?
     private var refreshTask: Task<Void, Never>?
@@ -655,7 +654,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func top25Loop() async {
         while true {
-            if let t = try? await ESPN.fetchTop25(), !t.isEmpty { top25 = t }
+            if let t = try? await ESPN.fetchTop25(), !t.isEmpty { settings.setTop25(t) }
             try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
         }
     }
@@ -760,7 +759,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             ticker.setColors(background: .black, accent: defaultAccent, accentHeight: 1)
         }
-        if Prefs.favoriteOnly, let fav = Prefs.favoriteTeamID {
+        if Prefs.favoriteOnly, Prefs.favoriteTeamID != nil {
             shownGames = []
             if let g = favoriteGame() {
                 shownGames = [g]
@@ -853,42 +852,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(item("Check for Updates…", #selector(checkForUpdates)))
         menu.addItem(.separator())
 
-        menu.addItem(item("Top 25 Games Only", #selector(toggleRankedOnly), checked: Prefs.rankedOnly))
-        menu.addItem(item("Show Final Scores", #selector(toggleFinals), checked: Prefs.showFinals))
-        menu.addItem(item("Show Upcoming Games", #selector(toggleUpcoming), checked: Prefs.showUpcoming))
-        menu.addItem(.separator())
-
-        let speedMenu = NSMenu()
-        for (title, v) in Prefs.speeds {
-            let it = item(title, #selector(setSpeed(_:)), checked: Prefs.speed == v)
-            it.representedObject = v
-            speedMenu.addItem(it)
-        }
-        let speedItem = NSMenuItem(title: "Scroll Speed", action: nil, keyEquivalent: "")
-        speedItem.submenu = speedMenu
-        menu.addItem(speedItem)
-
-        let posMenu = NSMenu()
-        posMenu.addItem(item("Bottom of Screen", #selector(setBottom), checked: !Prefs.atTop))
-        posMenu.addItem(item("Top of Screen", #selector(setTop), checked: Prefs.atTop))
-        let posItem = NSMenuItem(title: "Position", action: nil, keyEquivalent: "")
-        posItem.submenu = posMenu
-        menu.addItem(posItem)
-        menu.addItem(.separator())
-
-        let topMenu = NSMenu()
-        if top25.isEmpty {
-            topMenu.addItem(withTitle: "Loading…", action: nil, keyEquivalent: "").isEnabled = false
-        } else {
-            for t in top25 {
-                let rec = t.record.isEmpty ? "" : "  (\(t.record))"
-                topMenu.addItem(withTitle: String(format: "%2d  %@%@", t.rank, t.name, rec), action: nil, keyEquivalent: "").isEnabled = false
-            }
-        }
-        let topItem = NSMenuItem(title: "AP Top 25", action: nil, keyEquivalent: "")
-        topItem.submenu = topMenu
-        menu.addItem(topItem)
-        menu.addItem(.separator())
         menu.addItem(item("Quit Hoops Ticker", #selector(quit), key: "q"))
     }
 
@@ -920,12 +883,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Prefs.favoriteOnly.toggle()
         settingChanged(.favoriteOnly)
     }
-    @objc private func toggleRankedOnly() { Prefs.rankedOnly.toggle(); render() }
-    @objc private func toggleFinals() { Prefs.showFinals.toggle(); render() }
-    @objc private func toggleUpcoming() { Prefs.showUpcoming.toggle(); render() }
-    @objc private func setSpeed(_ s: NSMenuItem) { Prefs.speed = s.representedObject as? Double ?? 2.0; render() }
-    @objc private func setBottom() { Prefs.atTop = false; settingChanged(.position); settings.sync() }
-    @objc private func setTop() { Prefs.atTop = true; settingChanged(.position); settings.sync() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
 

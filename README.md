@@ -31,9 +31,8 @@ Requires macOS 12 or later. Runs on Apple Silicon and Intel Macs.
 
 Click 🏀 in the menu bar for:
 
-- **Settings…** to choose your teams, conference, display, position, scroll speed, alerts and which games to show
+- **Settings…** to choose your teams, conference, display, position, scroll speed, alerts and which games to show, and to browse the AP Top 25
 - **Hide / Show Ticker**
-- **AP Top 25**
 - **Refresh Now**
 - **Check for Updates…**
 

@@ -170,6 +170,7 @@ final class SettingsController: NSObject {
     private let speedPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let extraPopup = NSPopUpButton(frame: .zero, pullsDown: true)
     private let conferencePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let top25Popup = NSPopUpButton(frame: .zero, pullsDown: true)
     private let displayPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let hoverBox = NSButton(checkboxWithTitle: "Pause while the pointer is over it", target: nil, action: nil)
     private let flashPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -201,6 +202,8 @@ final class SettingsController: NSObject {
         extraPopup.addItem(withTitle: "Loading teams…")
         extraPopup.isEnabled = false
         conferencePopup.addItem(withTitle: "All Division I")
+        top25Popup.addItem(withTitle: "Loading…")
+        top25Popup.isEnabled = false
         for c: NSControl in [teamPopup, conferencePopup, favoriteOnlyBox, colorsBox, notifyBox, positionPopup, displayPopup, speedPopup, hoverBox, flashPopup, rankedBox, finalsBox, upcomingBox, recordsBox, logosBox, tagsBox, loginBox, updatesBox] {
             c.target = self
             c.action = #selector(changed(_:))
@@ -255,6 +258,7 @@ final class SettingsController: NSObject {
             [label("Show:"), showStack],
             [label("Startup:"), loginBox],
             [label("Updates:"), updatesBox],
+            [label("AP Top 25:"), top25Popup],
         ])
         grid.column(at: 0).xPlacement = .trailing
         grid.rowAlignment = .firstBaseline
@@ -274,6 +278,7 @@ final class SettingsController: NSObject {
             teamPopup.widthAnchor.constraint(equalToConstant: 280),
             extraPopup.widthAnchor.constraint(equalToConstant: 280),
             conferencePopup.widthAnchor.constraint(equalToConstant: 280),
+            top25Popup.widthAnchor.constraint(equalToConstant: 280),
             hint.widthAnchor.constraint(equalToConstant: 280),
             onlyHint.widthAnchor.constraint(equalToConstant: 280),
             notifyHint.widthAnchor.constraint(equalToConstant: 280),
@@ -285,6 +290,21 @@ final class SettingsController: NSObject {
     }
 
     private var teamNames: [String: String] = [:]
+
+    /// The current AP poll, as a list to look through (nothing in it is clickable).
+    func setTop25(_ teams: [RankedTeam]) {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "Current poll", action: nil, keyEquivalent: ""))   // the pull-down's title
+        for t in teams {
+            let rec = t.record.isEmpty ? "" : "  (\(t.record))"
+            let it = NSMenuItem(title: String(format: "%2d  %@%@", t.rank, t.name, rec), action: nil, keyEquivalent: "")
+            it.isEnabled = false
+            menu.addItem(it)
+        }
+        top25Popup.menu = menu
+        top25Popup.autoenablesItems = false
+        top25Popup.isEnabled = true
+    }
 
     func setConferences(_ list: [Conference]) {
         let menu = NSMenu()

@@ -14,8 +14,10 @@ enum Palette {
     static let dim = NSColor(calibratedWhite: 0.4, alpha: 1)
 }
 
-func buildTickerText(_ games: [Game], favoriteID: String?, font: NSFont) -> NSAttributedString {
-    let out = NSMutableAttributedString()
+/// One attributed string per game (separator included), so the ticker only draws what's on screen.
+func buildTickerSegments(_ games: [Game], favoriteID: String?, font: NSFont) -> [NSAttributedString] {
+    var out = NSMutableAttributedString()
+    var parts: [NSAttributedString] = []
     func add(_ s: String, _ c: NSColor) {
         out.append(NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: c]))
     }
@@ -28,7 +30,7 @@ func buildTickerText(_ games: [Game], favoriteID: String?, font: NSFont) -> NSAt
     if games.isEmpty {
         add("NO GAMES TO SHOW RIGHT NOW", Palette.dim)
         add("          ", Palette.dim)
-        return out
+        return [out]
     }
     for g in games {
         if let fav = favoriteID, g.involves(fav) { add("★ ", Palette.favorite) }
@@ -50,57 +52,186 @@ func buildTickerText(_ games: [Game], favoriteID: String?, font: NSFont) -> NSAt
             add("   \(g.detail.uppercased())", Palette.upcoming)
         }
         add("      ◆      ", Palette.dim)
+        parts.append(out)
+        out = NSMutableAttributedString()
     }
-    return out
+    return parts
 }
 
+/// Scrolls the games with Core Animation: each game is drawn once into a small image,
+/// and the GPU slides a strip of those images. Only games within about a screen's width
+/// of the visible area exist as layers at any moment, so CPU and memory stay flat.
 final class TickerView: NSView {
-    private var content = NSAttributedString()
-    private var contentWidth: CGFloat = 0
-    private var offset: CGFloat = 0
-    var speed: CGFloat = 2.0
-    private var timer: Timer?
+    private struct Segment { let text: NSAttributedString; let x: CGFloat; let width: CGFloat }
 
-    override var isFlipped: Bool { true }
+    private var lastParts: [NSAttributedString] = []
+    private var segments: [Segment] = []
+    private var total: CGFloat = 0
+    private let strip = CALayer()
+    private let accent = CALayer()
+    private var liveLayers: [String: CALayer] = [:]   // "segment:copy" -> layer
+    private var images: [Int: CGImage] = [:]          // segment -> rendered image
+    private var tick: Timer?
+
+    /// Points per frame at 60 fps (kept from the original timer-based ticker).
+    var speed: CGFloat = 2.0 {
+        didSet { if speed != oldValue { restart(at: currentOffset()) } }
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
-            guard let self, self.contentWidth > 0, self.window?.isVisible == true else { return }
-            self.offset += self.speed
-            if self.offset >= self.contentWidth { self.offset -= self.contentWidth }
-            self.needsDisplay = true
-        }
-        RunLoop.main.add(timer!, forMode: .common)
+        wantsLayer = true
+        layer!.backgroundColor = NSColor.black.cgColor
+        layer!.masksToBounds = true
+        strip.anchorPoint = .zero
+        strip.actions = ["position": NSNull(), "sublayers": NSNull(), "bounds": NSNull()]
+        layer!.addSublayer(strip)
+        accent.backgroundColor = NSColor(calibratedWhite: 0.25, alpha: 1).cgColor
+        accent.actions = ["position": NSNull(), "bounds": NSNull()]
+        layer!.addSublayer(accent)
+        // Light bookkeeping a few times a second: add layers coming into view, drop ones that left.
+        tick = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.updateVisible() }
+        RunLoop.main.add(tick!, forMode: .common)
     }
     required init?(coder: NSCoder) { fatalError() }
 
-    func set(_ text: NSAttributedString) {
-        content = text
-        contentWidth = ceil(text.size().width)
-        if offset >= contentWidth { offset = 0 }
-        needsDisplay = true
+    func set(_ parts: [NSAttributedString]) {
+        // Refreshes usually change nothing; skip the rebuild so scrolling isn't disturbed.
+        guard parts != lastParts else { return }
+        lastParts = parts
+        let keep = currentOffset()
+        var x: CGFloat = 0
+        segments = parts.map { s in
+            let w = ceil(s.size().width)
+            defer { x += w }
+            return Segment(text: s, x: x, width: w)
+        }
+        total = x
+        clearLayers()
+        restart(at: total > 0 ? keep.truncatingRemainder(dividingBy: total) : 0)
     }
 
     /// Jump back so the first game is at the left edge.
-    func resetToStart() {
-        offset = 0
-        needsDisplay = true
+    func resetToStart() { restart(at: 0) }
+
+    override func layout() {
+        super.layout()
+        accent.frame = CGRect(x: 0, y: Prefs.atTop ? 0 : bounds.height - 1, width: bounds.width, height: 1)
     }
 
-    override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
-        bounds.fill()
-        guard contentWidth > 0 else { return }
-        let h = content.size().height
-        let y = (bounds.height - h) / 2
-        var x = -offset
-        while x < bounds.width {
-            content.draw(at: NSPoint(x: x, y: y))
-            x += contentWidth
+    override func setFrameSize(_ newSize: NSSize) {
+        let heightChanged = newSize.height != frame.height
+        super.setFrameSize(newSize)
+        if heightChanged { clearLayers() }
+        needsLayout = true
+        updateVisible()
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        clearLayers()
+        updateVisible()
+    }
+
+    // MARK: Scrolling
+
+    private func currentOffset() -> CGFloat {
+        guard total > 0 else { return 0 }
+        let x = (strip.presentation() ?? strip).position.x
+        let o = (-x).truncatingRemainder(dividingBy: total)
+        return o < 0 ? o + total : o
+    }
+
+    private func restart(at offset: CGFloat) {
+        strip.removeAllAnimations()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        strip.position = CGPoint(x: -offset, y: 0)
+        CATransaction.commit()
+        let pointsPerSecond = speed * 60
+        if total > 0, pointsPerSecond > 0 {
+            let anim = CABasicAnimation(keyPath: "position.x")
+            anim.fromValue = 0
+            anim.toValue = -total
+            anim.duration = Double(total / pointsPerSecond)
+            anim.repeatCount = .infinity
+            anim.timeOffset = Double(offset / pointsPerSecond)
+            anim.isRemovedOnCompletion = false
+            strip.add(anim, forKey: "scroll")
         }
-        NSColor(calibratedWhite: 0.25, alpha: 1).setFill()
-        NSRect(x: 0, y: Prefs.atTop ? bounds.height - 1 : 0, width: bounds.width, height: 1).fill()
+        updateVisible(offset: offset)
+    }
+
+    // MARK: Layers
+
+    private func clearLayers() {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        liveLayers.values.forEach { $0.removeFromSuperlayer() }
+        CATransaction.commit()
+        liveLayers.removeAll()
+        images.removeAll()
+    }
+
+    private func updateVisible(offset: CGFloat? = nil) {
+        guard total > 0, bounds.width > 0, bounds.height > 0 else { return }
+        let off = offset ?? currentOffset()
+        let margin = bounds.width
+        // Cover the visible window plus a margin, and the same window one loop earlier,
+        // so the layers are already there when the animation wraps back to the start.
+        let ranges = [(off - margin, off + bounds.width + margin),
+                      (off - total - margin, off - total + bounds.width + margin)]
+        let scale = window?.backingScaleFactor ?? 2
+        let h = bounds.height
+
+        var wanted = Set<String>()
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for (start, end) in ranges {
+            for j in Int((start / total).rounded(.down))...Int((end / total).rounded(.down)) {
+                for (i, s) in segments.enumerated() {
+                    let x = CGFloat(j) * total + s.x
+                    guard x + s.width > start, x < end else { continue }
+                    let key = "\(i):\(j)"
+                    guard wanted.insert(key).inserted, liveLayers[key] == nil else { continue }
+                    let l = CALayer()
+                    l.isOpaque = true
+                    l.contentsScale = scale
+                    l.contents = image(for: i, scale: scale, height: h)
+                    l.frame = CGRect(x: x, y: 0, width: s.width, height: h)
+                    strip.addSublayer(l)
+                    liveLayers[key] = l
+                }
+            }
+        }
+        for (key, l) in liveLayers where !wanted.contains(key) {
+            l.removeFromSuperlayer()
+            liveLayers[key] = nil
+        }
+        CATransaction.commit()
+        let inUse = Set(liveLayers.keys.compactMap { Int($0.split(separator: ":")[0]) })
+        images = images.filter { inUse.contains($0.key) }
+    }
+
+    private func image(for i: Int, scale: CGFloat, height: CGFloat) -> CGImage? {
+        if let cached = images[i] { return cached }
+        let s = segments[i]
+        let w = Int((s.width * scale).rounded(.up)), h = Int((height * scale).rounded(.up))
+        guard w > 0, h > 0,
+              let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
+                                  space: CGColorSpaceCreateDeviceRGB(),
+                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+        ctx.scaleBy(x: scale, y: scale)
+        ctx.setFillColor(NSColor.black.cgColor)
+        ctx.fill(CGRect(x: 0, y: 0, width: s.width, height: height))
+        // AppKit string drawing honors the NSColor attributes (Core Text's CTLineDraw ignores them).
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
+        s.text.draw(at: NSPoint(x: 0, y: ((height - s.text.size().height) / 2).rounded()))
+        NSGraphicsContext.restoreGraphicsState()
+        let img = ctx.makeImage()
+        images[i] = img
+        return img
     }
 }
 
@@ -318,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func render() {
         ticker.speed = CGFloat(Prefs.speed)
         let list = visibleGames()
-        ticker.set(buildTickerText(list, favoriteID: Prefs.favoriteTeamID, font: font))
+        ticker.set(buildTickerSegments(list, favoriteID: Prefs.favoriteTeamID, font: font))
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             print("--- render: \(list.count) games, lookahead days loaded: \(lookahead.filter { !$0.isEmpty }.count)")
             for g in list.prefix(200) {
@@ -335,7 +466,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         switch change {
         case .position:
             layoutPanel()
-            ticker.needsDisplay = true
+            ticker.needsLayout = true
         case .display:
             render()
         case .favorite:

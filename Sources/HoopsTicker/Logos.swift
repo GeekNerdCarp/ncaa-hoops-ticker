@@ -9,7 +9,15 @@ final class LogoStore {
 
     /// Called (at most twice a second) after new logos arrive, so the ticker can redraw.
     var onLoad: (() -> Void)?
-    let size: CGFloat = 26
+    private(set) var size: CGFloat = 26
+
+    /// Match the logos to the ticker's text size (26 pt logos at the default 22 pt text).
+    func configure(fontSize: CGFloat) {
+        let new = (fontSize * 26 / 22).rounded()
+        guard new != size else { return }
+        size = new
+        attachments.removeAll()
+    }
 
     private var attachments: [String: NSTextAttachment] = [:]
     private var loading = Set<String>()

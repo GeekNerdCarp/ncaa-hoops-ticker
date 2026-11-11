@@ -14,6 +14,7 @@ enum Palette {
     static let dim = NSColor(calibratedWhite: 1, alpha: 0.45)
     static let network = NSColor(calibratedWhite: 0.72, alpha: 1)
     static let alert = NSColor(calibratedRed: 1.0, green: 0.22, blue: 0.2, alpha: 1)
+    static let marquee = NSColor(calibratedRed: 1.0, green: 0.78, blue: 0.2, alpha: 1)
 }
 
 extension NSColor {
@@ -96,7 +97,14 @@ func buildTickerSegments(_ games: [Game], followed: Set<String>, font: NSFont, s
     for g in games {
         let mine = followed.contains(g.away.teamID) || followed.contains(g.home.teamID)
         if mine { add("★ ", Palette.favorite) }
-        if Prefs.showAlertTags, let tag = g.isUpsetBrewing ? "UPSET ALERT" : (g.isCloseLate ? "CLOSE" : nil) {
+        let hide = g.scoresHidden
+        if Prefs.showMarquee, g.isMarquee {
+            // Black on gold: a different badge from the red alerts, and it can sit next to one.
+            out.append(NSAttributedString(string: " MARQUEE ", attributes: [.font: font, .foregroundColor: NSColor.black,
+                                                                          .backgroundColor: Palette.marquee]))
+            add("  ", Palette.dim)
+        }
+        if Prefs.showAlertTags, !hide, let tag = g.isUpsetBrewing ? "UPSET ALERT" : (g.isCloseLate ? "CLOSE" : nil) {
             // White on red, so it reads as a badge rather than more ticker text.
             out.append(NSAttributedString(string: " \(tag) ", attributes: [.font: font, .foregroundColor: NSColor.white,
                                                                           .backgroundColor: Palette.alert]))
@@ -104,18 +112,18 @@ func buildTickerSegments(_ games: [Game], followed: Set<String>, font: NSFont, s
         }
         switch g.state {
         case .live:
-            team(g.away, showScore: true, live: true)
-            add("  –  ", Palette.dim)
-            team(g.home, showScore: true, live: true)
-            add("   \(g.detail.uppercased())", Palette.live)
+            team(g.away, showScore: !hide, live: true)
+            add(hide ? "  @  " : "  –  ", Palette.dim)
+            team(g.home, showScore: !hide, live: true)
+            add("   \(hide ? "LIVE" : g.detail.uppercased())", Palette.live)
             if let r = g.round { add(" · \(r)", Palette.rank) }
             // Where to watch your own team's game while it's on.
             if mine, let n = g.network { add(" · \(n.uppercased())", Palette.network) }
         case .final:
-            team(g.away, showScore: true, live: false)
-            add("  –  ", Palette.dim)
-            team(g.home, showScore: true, live: false)
-            add("   \(g.detail.uppercased())", Palette.final)
+            team(g.away, showScore: !hide, live: false)
+            add(hide ? "  @  " : "  –  ", Palette.dim)
+            team(g.home, showScore: !hide, live: false)
+            add("   \(hide ? "FINAL" : g.detail.uppercased())", Palette.final)
             if let r = g.round { add(" · \(r)", Palette.rank) }
         case .upcoming:
             team(g.away, showScore: false, live: false)
@@ -149,6 +157,15 @@ final class TickerView: NSView {
     private var centered = false   // one still segment in the middle instead of scrolling
     private var background = NSColor.black
     private var accentHeight: CGFloat = 1
+    /// 1 is solid black (or the team color); less lets the desktop show through.
+    var barOpacity: CGFloat = 1 {
+        didSet {
+            guard barOpacity != oldValue else { return }
+            layer!.backgroundColor = background.withAlphaComponent(barOpacity).cgColor
+            clearLayers()
+            updateVisible()
+        }
+    }
     private var downAt: NSPoint?
     private var keys: [String] = []               // game id for each segment ("" for messages)
     private var pendingFlash = Set<String>()      // games whose score changed, waiting to be on screen
@@ -156,7 +173,7 @@ final class TickerView: NSView {
     private var paused = false
 
     /// Called with the index of the segment that was clicked.
-    var onClick: ((Int) -> Void)?
+    var onClick: ((Int, CGFloat) -> Void)?
 
     /// Points per frame at 60 fps (kept from the original timer-based ticker).
     var speed: CGFloat = 2.0 {
@@ -217,7 +234,7 @@ final class TickerView: NSView {
         guard bg != background || accent.cgColor != self.accent.backgroundColor || h != accentHeight else { return }
         background = bg
         accentHeight = h
-        layer!.backgroundColor = bg.cgColor
+        layer!.backgroundColor = bg.withAlphaComponent(barOpacity).cgColor
         self.accent.backgroundColor = accent.cgColor
         needsLayout = true
         clearLayers()   // segment images have the old background baked in
@@ -264,7 +281,7 @@ final class TickerView: NSView {
         let p = convert(event.locationInWindow, from: nil)
         defer { downAt = nil }
         guard let d = downAt, hypot(p.x - d.x, p.y - d.y) < 6, let i = segmentIndex(at: p.x) else { return }
-        onClick?(i)
+        onClick?(i, p.x)
     }
 
     /// Which segment is under this x position right now (the strip may be mid-scroll).
@@ -284,14 +301,27 @@ final class TickerView: NSView {
         addTrackingArea(NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeAlways, .inVisibleRect],
                                        owner: self, userInfo: nil))
     }
+    private var hovering = false
+    private var held = false
+
     override func mouseEntered(with event: NSEvent) {
         if !hand { NSCursor.pointingHand.push(); hand = true }
-        if Prefs.pauseOnHover { setPaused(true) }
+        hovering = true
+        applyPause()
     }
     override func mouseExited(with event: NSEvent) {
         if hand { NSCursor.pop(); hand = false }
-        setPaused(false)
+        hovering = false
+        applyPause()
     }
+
+    /// Hold the strip still (for example while a popup is open on it).
+    func hold(_ on: Bool) {
+        held = on
+        applyPause()
+    }
+
+    private func applyPause() { setPaused(held || (hovering && Prefs.pauseOnHover)) }
 
     /// Hold the strip where it is (so a score can be read), or carry on from there.
     private func setPaused(_ p: Bool) {
@@ -365,7 +395,7 @@ final class TickerView: NSView {
                     let key = "\(i):\(j)"
                     guard wanted.insert(key).inserted, liveLayers[key] == nil else { continue }
                     let l = CALayer()
-                    l.isOpaque = true
+                    l.isOpaque = barOpacity >= 1
                     l.contentsScale = scale
                     l.contents = image(for: i, scale: scale, height: h)
                     l.frame = CGRect(x: x, y: 0, width: s.width, height: h)
@@ -425,10 +455,12 @@ final class TickerView: NSView {
         guard w > 0, h > 0,
               let ctx = CGContext(data: nil, width: w, height: h, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue) else { return nil }
+                                  bitmapInfo: (barOpacity < 1 ? CGImageAlphaInfo.premultipliedLast : .noneSkipLast).rawValue) else { return nil }
         ctx.scaleBy(x: scale, y: scale)
-        ctx.setFillColor(background.cgColor)
-        ctx.fill(CGRect(x: 0, y: 0, width: s.width, height: height))
+        if barOpacity >= 1 {   // see-through bars leave the background to the layer behind
+            ctx.setFillColor(background.cgColor)
+            ctx.fill(CGRect(x: 0, y: 0, width: s.width, height: height))
+        }
         // AppKit string drawing honors the NSColor attributes (Core Text's CTLineDraw ignores them).
         NSGraphicsContext.saveGraphicsState()
         NSGraphicsContext.current = NSGraphicsContext(cgContext: ctx, flipped: false)
@@ -481,8 +513,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var ticker: TickerView!
     private var statusItem: NSStatusItem!
     private let settings = SettingsController()
-    private let updater = Updater()
     private let alerts = TeamAlerts()
+    private let boxPopover = BoxScorePopover()
 
     private var games: [Game] = []          // today
     private var lookahead: [[Game]] = []    // tomorrow onward, one array per day
@@ -490,14 +522,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var lastUpdate: Date?
     private var lastError: String?
     private var refreshTask: Task<Void, Never>?
+    private var forceShown = false          // auto-hide is on, but you chose Show Ticker
+    private var forceHidden = false         // auto-hide is on, but you chose Hide Ticker during a game
+    private var knownChannels = Set<String>()
     private var shownGames: [Game] = []     // what each ticker segment is, for clicks
     private var teamColors: [String: (String?, String?)] = [:]   // team id -> (primary, alternate) hex
     private var lastLive: [String: Game] = [:]   // previous snapshot of each live game, to spot baskets
     private var lastFullRefresh = Date.distantPast
 
     private let lookaheadDays = 6
-    private let barHeight: CGFloat = 44
-    private lazy var font = NSFont.monospacedSystemFont(ofSize: 22, weight: .heavy)
+    private var barHeight: CGFloat { Prefs.fontPoints + 22 }   // 44 at the default 22 pt text
+    private var font: NSFont { .monospacedSystemFont(ofSize: Prefs.fontPoints, weight: .heavy) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -505,8 +540,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel = NSPanel(contentRect: .zero, styleMask: [.borderless, .nonactivatingPanel],
                         backing: .buffered, defer: false)
         panel.level = .statusBar
-        panel.isOpaque = true
-        panel.backgroundColor = .black
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
         panel.hasShadow = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary, .ignoresCycle]
@@ -521,7 +556,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.delegate = self
         statusItem.menu = menu
         ticker.menu = menu
-        ticker.onClick = { [weak self] i in self?.openGame(at: i) }
+        ticker.onClick = { [weak self] i, x in self?.gameClicked(at: i, x: x) }
+        boxPopover.onOpenESPN = { [weak self] g in self?.openESPN(g) }
+        boxPopover.onVisibility = { [weak self] open in self?.ticker.hold(open) }
         LogoStore.shared.onLoad = { [weak self] in self?.render() }
 
         settings.onChange = { [weak self] change in self?.settingChanged(change) }
@@ -529,15 +566,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(layoutPanel),
                                                name: NSApplication.didChangeScreenParametersNotification, object: nil)
         layoutPanel()
-        if !Prefs.hidden { panel.orderFrontRegardless() }
+        applyLook()
         render()
+        Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateVisibility() }
+        }
 
         refreshTask = Task { await refreshLoop() }
         Task { await lookaheadLoop() }
         Task { await top25Loop() }
         Task { await loadTeams() }
         Task { await loadConferences() }
-        updater.startAutomaticChecks()
         alerts.start()
         if ProcessInfo.processInfo.environment["HOOPS_DEBUG"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 4) { self.settings.show() }
@@ -556,6 +595,72 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let y = Prefs.atTop ? vf.maxY - barHeight : vf.minY
         panel.setFrame(NSRect(x: screen.frame.minX, y: y, width: screen.frame.width, height: barHeight), display: true)
         ticker.frame = NSRect(x: 0, y: 0, width: screen.frame.width, height: barHeight)
+    }
+
+    /// Text size and opacity from Settings.
+    private func applyLook() {
+        LogoStore.shared.configure(fontSize: Prefs.fontPoints)
+        ticker.barOpacity = CGFloat(Prefs.barOpacity)
+    }
+
+    // MARK: Visibility and the menu bar score
+
+    /// Whether the bar should be up for auto-hide: a followed team is playing or about to.
+    private func followedGameIsOn() -> Bool {
+        let followed = Prefs.followedIDs
+        guard !followed.isEmpty else { return true }   // nothing to wait for: never hide
+        return games.contains { g in
+            guard followed.contains(g.away.teamID) || followed.contains(g.home.teamID) else { return false }
+            return g.state == .live || (g.state == .upcoming && g.start.timeIntervalSinceNow <= 30 * 60)
+        }
+    }
+
+    private func updateVisibility() {
+        var show = !Prefs.hidden
+        if Prefs.autoHide {
+            let on = followedGameIsOn()
+            if on { forceShown = false } else { forceHidden = false }
+            show = (on && !forceHidden) || forceShown
+        }
+        if show != panel.isVisible {
+            if show { panel.orderFrontRegardless() } else { panel.orderOut(nil) }
+        }
+    }
+
+    /// The game to show in the menu bar: a followed team's live game, else its game today, else its final.
+    private func menuBarGame() -> Game? {
+        let followed = Prefs.followedIDs
+        for pass in [GameState.live, .upcoming, .final] {
+            for id in followed {
+                if let g = games.first(where: { g in
+                    g.involves(id) && g.state == pass
+                        && (pass != .upcoming || Calendar.current.isDateInToday(g.start))
+                        && (pass != .final || g.start.timeIntervalSinceNow > -12 * 3600)
+                }) { return g }
+            }
+        }
+        return nil
+    }
+
+    private func menuBarText(_ g: Game) -> String {
+        func name(_ s: Side) -> String { s.abbr ?? s.name }
+        func pts(_ s: Side) -> String { s.score ?? "0" }
+        if g.scoresHidden { return "\(name(g.away)) @ \(name(g.home))  " + (g.state == .live ? "Live" : "Final") }
+        switch g.state {
+        case .live:
+            let when = g.isHalftime ? "Half" : g.detail.replacingOccurrences(of: " - ", with: " ")
+            return "\(name(g.away)) \(pts(g.away))–\(pts(g.home)) \(name(g.home))  \(when)"
+        case .upcoming:
+            return "\(name(g.away)) @ \(name(g.home))  \(g.detail)"
+        case .final:
+            return "\(name(g.away)) \(pts(g.away))–\(pts(g.home)) \(name(g.home))  " + g.detail.replacingOccurrences(of: "Final", with: "F")
+        }
+    }
+
+    private func menuBarTitle() -> String {
+        if Prefs.menuBarScore, let g = menuBarGame() { return " " + menuBarText(g) }
+        let live = games.filter { $0.state == .live }.count
+        return live > 0 ? " \(live)" : ""
     }
 
     // MARK: Data
@@ -587,6 +692,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             for fav in Prefs.followedIDs {
                 for g in games where g.involves(fav) { alerts.observe(g, favoriteID: fav) }
             }
+            alerts.remind(games + (lookahead.first ?? []), followed: Set(Prefs.followedIDs))
             render()
             ticker.flash(scoreChanges())
             if first, !games.isEmpty { ticker.resetToStart(); first = false }
@@ -599,7 +705,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// Live games that should glow this refresh, per the "Flash score changes" setting.
     private func scoreChanges() -> Set<String> {
         var out = Set<String>()
-        for g in games where g.state == .live {
+        for g in games where g.state == .live && !g.scoresHidden {
             if let prev = lastLive[g.id],
                shouldFlash(prev: prev, now: g, mode: Prefs.flashMode, followed: Set(Prefs.followedIDs)) {
                 out.insert(g.id)
@@ -654,7 +760,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func top25Loop() async {
         while true {
-            if let t = try? await ESPN.fetchTop25(), !t.isEmpty { settings.setTop25(t) }
+            if let poll = try? await ESPN.fetchPoll(), !poll.teams.isEmpty {
+                settings.setTop25(poll.teams)
+                alerts.observePoll(poll, followed: Set(Prefs.followedIDs))
+            }
             try? await Task.sleep(nanoseconds: 30 * 60 * 1_000_000_000)
         }
     }
@@ -705,14 +814,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
         }
 
+        // Channel filter: live and upcoming games only, and never your followed teams' games.
+        if !Prefs.channelFilter.isEmpty {
+            let allowed = Set(Prefs.channelFilter.map { $0.lowercased() })
+            let followed = Prefs.followedIDs
+            list = list.filter { g in
+                g.state == .final || allowed.contains((g.network ?? "").lowercased())
+                    || followed.contains { g.involves($0) }
+            }
+        }
+
         // Upsets brewing, then close finishes, then other live games, upcoming, finals.
         func order(_ g: Game) -> Int {
             switch g.state {
             case .live:
-                guard Prefs.showAlertTags else { return 2 }
-                return g.isUpsetBrewing ? 0 : (g.isCloseLate ? 1 : 2)
-            case .upcoming: return 3
-            case .final: return 4
+                if Prefs.showAlertTags && !g.scoresHidden {
+                    if g.isUpsetBrewing { return 0 }
+                    if g.isCloseLate { return 1 }
+                }
+                return Prefs.showMarquee && g.isMarquee ? 2 : 3
+            case .upcoming: return 4
+            case .final: return 5
             }
         }
         list.sort {
@@ -779,15 +901,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             fflush(stdout)
         }
-        let live = games.filter { $0.state == .live }.count
-        statusItem.button?.title = live > 0 ? " \(live)" : ""
+        boxPopover.update(with: games)
+        statusItem.button?.title = menuBarTitle()
+        statusItem.button?.font = .monospacedDigitSystemFont(ofSize: NSFont.systemFontSize, weight: .regular)
+        statusItem.button?.toolTip = Prefs.menuBarScore ? menuBarGame().map(menuBarText) : nil
+        updateVisibility()
+        var channels = Set(Prefs.channelFilter)
+        for g in games + lookahead.joined() { if let n = g.network { channels.insert(n) } }
+        if channels != knownChannels { knownChannels = channels; settings.setChannels(channels.sorted()) }
         settings.sync()
     }
 
-    /// Open ESPN's page for the clicked game: live gamecast, box score, or preview.
-    private func openGame(at i: Int) {
-        guard shownGames.indices.contains(i),
-              let url = URL(string: "https://www.espn.com/mens-college-basketball/game/_/gameId/\(shownGames[i].id)") else { return }
+    /// A game on the ticker was clicked: show its box score, or go straight to ESPN, per the setting.
+    private func gameClicked(at i: Int, x: CGFloat) {
+        guard shownGames.indices.contains(i) else { return }
+        let g = shownGames[i]
+        if Prefs.clickAction == 1 { openESPN(g); return }
+        if boxPopover.shownGameID == g.id { boxPopover.close(); return }   // click again to close
+        boxPopover.show(g, in: ticker, at: x, below: Prefs.atTop)
+    }
+
+    /// ESPN's page for a game: live gamecast, box score, or preview.
+    private func openESPN(_ g: Game) {
+        guard let url = URL(string: "https://www.espn.com/mens-college-basketball/game/_/gameId/\(g.id)") else { return }
         NSWorkspace.shared.open(url)
     }
 
@@ -798,6 +934,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ticker.needsLayout = true
         case .display:
             render()
+        case .look:
+            layoutPanel()
+            applyLook()
+            render()
+        case .visibility:
+            forceShown = false
+            forceHidden = false
+            updateVisibility()
         case .favoriteOnly:
             render()
             restartRefreshLoop()
@@ -821,14 +965,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        if let a = updater.available {
-            let it = item("Update Available: Version \(a.version)…", #selector(showUpdate))
-            it.attributedTitle = NSAttributedString(string: it.title,
-                                                    attributes: [.font: NSFont.boldSystemFont(ofSize: NSFont.systemFontSize)])
-            menu.addItem(it)
-            menu.addItem(.separator())
-        }
-
         let live = games.filter { $0.state == .live }.count
         let up = games.filter { $0.state == .upcoming }.count
         let fin = games.filter { $0.state == .final }.count
@@ -846,6 +982,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         menu.addItem(.separator())
 
+        menu.addItem(item("Spoiler-Free Mode", #selector(toggleSpoilerFree), checked: Prefs.spoilerMode != 0))
         menu.addItem(item(panel.isVisible ? "Hide Ticker" : "Show Ticker", #selector(toggleTicker)))
         menu.addItem(item("Refresh Now", #selector(refreshNow)))
         menu.addItem(item("Settings…", #selector(openSettings), key: ","))
@@ -862,9 +999,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return it
     }
 
+    @objc private func toggleSpoilerFree() {
+        Prefs.spoilerMode = Prefs.spoilerMode == 0 ? 1 : 0   // on = my teams' games; pick "All games" in Settings
+        render()
+        settings.sync()
+    }
     @objc private func toggleTicker() {
-        if panel.isVisible { panel.orderOut(nil); Prefs.hidden = true }
-        else { panel.orderFrontRegardless(); Prefs.hidden = false }
+        if Prefs.autoHide {
+            // Override just this stretch: the bar's own rule takes over again next game.
+            let on = followedGameIsOn()
+            if panel.isVisible { if on { forceHidden = true }; forceShown = false }
+            else { if on { forceHidden = false } else { forceShown = true } }
+        } else {
+            Prefs.hidden = panel.isVisible
+        }
+        updateVisibility()
     }
     @objc private func refreshNow() {
         Task {
@@ -877,8 +1026,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
     }
     @objc private func openSettings() { settings.show() }
-    @objc private func checkForUpdates() { Task { await updater.check(userInitiated: true) } }
-    @objc private func showUpdate() { updater.promptToDownload() }
+    @objc private func checkForUpdates() { UpdateService.shared.checkForUpdates() }
     @objc private func toggleFavoriteOnly() {
         Prefs.favoriteOnly.toggle()
         settingChanged(.favoriteOnly)

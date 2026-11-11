@@ -28,6 +28,7 @@ struct CompetitorJSON: Decodable {
         let id: String
         let displayName: String
         let shortDisplayName: String?
+        let abbreviation: String?
     }
     struct Rk: Decodable { let current: Int }
 
@@ -115,16 +116,22 @@ struct RankingsResponse: Decodable {
     let rankings: [Poll]
     struct Poll: Decodable {
         let name: String
+        let headline: String?
+        let date: String?
         let ranks: [Rank]
+        let droppedOut: [Lossy<Dropped>]?
     }
     struct Rank: Decodable {
         let current: Int
+        let previous: Int?
         let recordSummary: String?
         let team: T
-        struct T: Decodable {
-            let location: String
-            let nickname: String?
-        }
+    }
+    struct Dropped: Decodable { let team: T }
+    struct T: Decodable {
+        let id: String?
+        let location: String
+        let nickname: String?
     }
 }
 
@@ -139,6 +146,7 @@ struct Side {
     let score: String?
     var record: String? = nil
     var seed: Int? = nil   // NCAA Tournament seed, 1...16
+    var abbr: String? = nil   // e.g. "UK"
 }
 
 struct Game {
@@ -164,6 +172,26 @@ struct Game {
         guard let a = Int(away.score ?? ""), let h = Int(home.score ?? "") else { return nil }
         return abs(a - h)
     }
+    /// Spoiler-free mode: should this game's score stay hidden? Games that haven't started have none.
+    var scoresHidden: Bool {
+        guard state != .upcoming else { return false }
+        switch Prefs.spoilerMode {
+        case 2: return true
+        case 1: return Prefs.followedIDs.contains { involves($0) }
+        default: return false
+        }
+    }
+
+    /// A matchup worth circling: two AP top-10 teams, or in the NCAA Tournament two top-3 seeds
+    /// or anything from the Elite 8 on. Finished games don't count.
+    var isMarquee: Bool {
+        guard state != .final else { return false }
+        if let a = away.rank, let h = home.rank { return a <= 10 && h <= 10 }
+        if let a = away.seed, let h = home.seed {
+            return (a <= 3 && h <= 3) || ["ELITE 8", "FINAL FOUR", "CHAMPIONSHIP"].contains(round ?? "")
+        }
+        return false
+    }
     /// Live, second half or overtime, 4:00 or less left, within 5 points.
     var isCloseLate: Bool {
         guard state == .live, period >= 2, clock <= 240, !isHalftime, let m = margin else { return false }
@@ -186,6 +214,17 @@ struct RankedTeam {
     let rank: Int
     let name: String
     let record: String
+    var id: String = ""
+    var previous: Int? = nil   // rank in the last poll; 0 or nil if it wasn't ranked
+}
+
+/// One week's AP poll.
+struct AppPoll {
+    let id: String          // changes every week
+    let title: String       // e.g. "Week 3"
+    let date: Date?
+    let teams: [RankedTeam]
+    let dropped: [(id: String, name: String)]
 }
 
 struct TeamInfo {
@@ -224,7 +263,7 @@ enum ESPN {
         return f
     }()
 
-    private static func get<T: Decodable>(_ type: T.Type, _ url: String) async throws -> T {
+    static func get<T: Decodable>(_ type: T.Type, _ url: String) async throws -> T {
         let (data, _) = try await URLSession.shared.data(from: URL(string: url)!)
         return try JSONDecoder().decode(T.self, from: data)
     }
@@ -301,12 +340,26 @@ enum ESPN {
         }.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    static func fetchTop25() async throws -> [RankedTeam] {
+    static func fetchTop25() async throws -> [RankedTeam] { try await fetchPoll().teams }
+
+    static func fetchPoll() async throws -> AppPoll {
         let r = try await get(RankingsResponse.self, "\(base)/rankings")
-        guard let ap = r.rankings.first(where: { $0.name.contains("AP") }) ?? r.rankings.first else { return [] }
-        return ap.ranks.map {
-            RankedTeam(rank: $0.current, name: $0.team.location, record: $0.recordSummary ?? "")
+        guard let ap = r.rankings.first(where: { $0.name.contains("AP") }) ?? r.rankings.first else {
+            return AppPoll(id: "", title: "", date: nil, teams: [], dropped: [])
         }
+        let headline = ap.headline ?? ""
+        let week = headline.range(of: "Top 25 ").map { String(headline[$0.upperBound...]) } ?? ""
+        return AppPoll(
+            id: headline.isEmpty ? (ap.date ?? "") : headline,
+            title: week,
+            date: ap.date.flatMap { startParser.date(from: $0) },
+            teams: ap.ranks.map {
+                RankedTeam(rank: $0.current, name: $0.team.location, record: $0.recordSummary ?? "",
+                           id: $0.team.id ?? "", previous: $0.previous)
+            },
+            dropped: (ap.droppedOut ?? []).compactMap { $0.value }.compactMap { d in
+                d.team.id.map { ($0, d.team.location) }
+            })
     }
 
     /// "NCAA Men's Basketball Championship - East Region - Sweet 16" -> "SWEET 16".
@@ -333,7 +386,8 @@ enum ESPN {
                         rank: valid && !isNCAA ? r : nil,
                         score: c.score,
                         record: c.record,
-                        seed: valid && isNCAA ? r : nil)
+                        seed: valid && isNCAA ? r : nil,
+                        abbr: c.team.abbreviation)
         }
         let start = startParser.date(from: e.date) ?? Date()
         let state: GameState
@@ -360,5 +414,71 @@ enum ESPN {
         game.clock = status.clock ?? 0
         game.isHalftime = status.type.name == "STATUS_HALFTIME"
         return game
+    }
+}
+
+// MARK: - Box score
+
+struct SummaryResponse: Decodable {
+    let boxscore: Box?
+    let plays: [Lossy<Play>]?
+    struct Box: Decodable { let teams: [TeamBox]?; let players: [PlayersBox]? }
+    struct TeamRef: Decodable { let id: String }
+    struct TeamBox: Decodable { let team: TeamRef; let statistics: [Stat]? }
+    struct Stat: Decodable { let label: String?; let displayValue: String? }
+    struct PlayersBox: Decodable { let team: TeamRef; let statistics: [Group]? }
+    struct Group: Decodable { let labels: [String]?; let athletes: [Athlete]? }
+    struct Athlete: Decodable { let athlete: Person; let stats: [String]? }
+    struct Person: Decodable { let displayName: String? }
+    struct Play: Decodable {
+        let text: String?
+        let period: Num?
+        let clock: Clk?
+        struct Num: Decodable { let number: Int? }
+        struct Clk: Decodable { let displayValue: String? }
+    }
+}
+
+/// What the click-through popup shows for one game.
+struct BoxScore {
+    struct Line {
+        var stats: [(label: String, value: String)] = []
+        var leaders: [String] = []
+    }
+    var lines: [String: Line] = [:]   // by team id
+    var lastPlay: String?
+}
+
+extension ESPN {
+    /// A game's team stats, top scorers and latest play. About 400 KB, so only fetched on a click.
+    static func fetchBoxScore(gameID: String) async throws -> BoxScore {
+        let r = try await get(SummaryResponse.self, "\(base)/summary?event=\(gameID)")
+        var box = BoxScore()
+        let keep = [("FG", "FG"), ("3PT", "3PT"), ("FT", "FT"), ("Rebounds", "REB"), ("Assists", "AST"), ("Turnovers", "TO")]
+        for t in r.boxscore?.teams ?? [] {
+            var line = BoxScore.Line()
+            for (key, label) in keep {
+                if let v = t.statistics?.first(where: { $0.label == key })?.displayValue { line.stats.append((label, v)) }
+            }
+            box.lines[t.team.id] = line
+        }
+        for pb in r.boxscore?.players ?? [] {
+            guard let g = pb.statistics?.first, let labels = g.labels else { continue }
+            let iP = labels.firstIndex(of: "PTS"), iR = labels.firstIndex(of: "REB"), iA = labels.firstIndex(of: "AST")
+            func val(_ a: SummaryResponse.Athlete, _ i: Int?) -> Int {
+                guard let i, let st = a.stats, st.indices.contains(i) else { return 0 }
+                return Int(st[i]) ?? 0
+            }
+            let top = (g.athletes ?? []).sorted { val($0, iP) > val($1, iP) }.prefix(2).filter { val($0, iP) > 0 }
+            box.lines[pb.team.id, default: BoxScore.Line()].leaders = top.map {
+                "\($0.athlete.displayName ?? "?")  \(val($0, iP)) pts, \(val($0, iR)) reb, \(val($0, iA)) ast"
+            }
+        }
+        if let p = r.plays?.compactMap({ $0.value }).last(where: { !($0.text ?? "").isEmpty }) {
+            let n = p.period?.number ?? 0
+            let half = n == 1 ? "1st" : (n == 2 ? "2nd" : (n > 2 ? "OT" : ""))
+            box.lastPlay = [p.clock?.displayValue, half].compactMap { $0 }.joined(separator: " ") + " · " + (p.text ?? "")
+        }
+        return box
     }
 }

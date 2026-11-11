@@ -19,7 +19,7 @@ final class TeamAlerts: NSObject, UNUserNotificationCenterDelegate {
         var events: [Event] = []
         if prev.state == .upcoming && g.state == .live { events.append(.tipoff) }
         if !prev.isHalftime && g.isHalftime { events.append(.halftime) }
-        if g.isCloseLate { events.append(.closeGame) }
+        if g.isCloseLate && !g.scoresHidden { events.append(.closeGame) }
         if prev.state != .final && g.state == .final { events.append(.final) }
 
         var done = sent[g.id, default: []]
@@ -29,7 +29,8 @@ final class TeamAlerts: NSObject, UNUserNotificationCenterDelegate {
         return events
     }
 
-    private func post(_ e: Event, _ g: Game, favoriteID: String) {
+    /// The notification text for an event. In spoiler-free mode it never includes a score or a result.
+    func message(_ e: Event, _ g: Game, favoriteID: String) -> (title: String, body: String) {
         let mine = g.away.teamID == favoriteID ? g.away : g.home
         let other = g.away.teamID == favoriteID ? g.home : g.away
         func label(_ s: Side) -> String {
@@ -38,29 +39,97 @@ final class TeamAlerts: NSObject, UNUserNotificationCenterDelegate {
         func score(_ s: Side) -> String { "\(s.name) \(s.score ?? "0")" }
         let line = "\(score(g.away)), \(score(g.home))"
         let tv = g.network.map { " · \($0)" } ?? ""
+        let hidden = g.scoresHidden
 
-        let title: String, body: String
         switch e {
         case .tipoff:
-            title = "\(mine.name) tips off"
-            body = "\(label(g.away)) @ \(label(g.home))\(tv)"
+            return ("\(mine.name) tips off", "\(label(g.away)) @ \(label(g.home))\(tv)")
         case .halftime:
-            title = "Halftime"
-            body = line
+            return ("Halftime", hidden ? "Score hidden (spoiler-free mode)" : line)
         case .closeGame:
-            title = "Close game: \(mine.name) vs \(other.name)"
-            body = "\(line) · \(g.detail)\(tv)"
+            return ("Close game: \(mine.name) vs \(other.name)", "\(line) · \(g.detail)\(tv)")
         case .final:
+            if hidden { return ("\(mine.name) game is over", "Score hidden (spoiler-free mode)") }
             let m = Int(mine.score ?? "") ?? 0, o = Int(other.score ?? "") ?? 0
-            title = m > o ? "\(mine.name) wins!" : "\(mine.name) loses"
-            body = "\(g.detail): \(line)"
+            return (m > o ? "\(mine.name) wins!" : "\(mine.name) loses", "\(g.detail): \(line)")
         }
+    }
+
+    private func post(_ e: Event, _ g: Game, favoriteID: String) {
+        let (title, body) = message(e, g, favoriteID: favoriteID)
         let content = UNMutableNotificationContent()
         content.title = "🏀 " + title
         content.body = body
         content.sound = .default
         UNUserNotificationCenter.current().add(
             UNNotificationRequest(identifier: "\(g.id)-\(e)", content: content, trigger: nil))
+    }
+
+    // MARK: AP poll
+
+    /// A new AP poll came out: say how your followed teams moved (or the top three, if none of them are in it).
+    /// The first poll ever seen, a poll we already told you about, and a poll over four days old stay quiet.
+    /// Returns the text sent, for testing.
+    @discardableResult
+    func observePoll(_ poll: AppPoll, followed: Set<String>, now: Date = Date()) -> (title: String, body: String)? {
+        let defaults = UserDefaults.standard
+        let last = defaults.string(forKey: "lastPollID")
+        guard !poll.id.isEmpty else { return nil }
+        defaults.set(poll.id, forKey: "lastPollID")
+        guard let last, last != poll.id, Prefs.pollAlerts else { return nil }
+        if let date = poll.date, now.timeIntervalSince(date) > 4 * 86400 { return nil }
+
+        var lines: [String] = []
+        for t in poll.teams where followed.contains(t.id) {
+            let before = t.previous ?? 0
+            if before == 0 { lines.append("\(t.name) enters the poll at #\(t.rank)") }
+            else if before > t.rank { lines.append("\(t.name) moves up \(before - t.rank) to #\(t.rank)") }
+            else if before < t.rank { lines.append("\(t.name) drops \(t.rank - before) to #\(t.rank)") }
+            else { lines.append("\(t.name) holds at #\(t.rank)") }
+        }
+        for t in poll.dropped where followed.contains(t.id) { lines.append("\(t.name) falls out of the poll") }
+        if lines.isEmpty {
+            lines = [poll.teams.sorted { $0.rank < $1.rank }.prefix(3).map { "#\($0.rank) \($0.name)" }.joined(separator: " · ")]
+        }
+        let title = "🏀 New AP Top 25" + (poll.title.isEmpty ? "" : " · \(poll.title)")
+        let body = lines.joined(separator: "\n")
+
+        let content = UNMutableNotificationContent()
+        content.title = title
+        content.body = body
+        content.sound = .default
+        UNUserNotificationCenter.current().add(
+            UNNotificationRequest(identifier: "poll-\(poll.id)", content: content, trigger: nil))
+        return (title, body)
+    }
+
+    // MARK: Reminders
+
+    private var reminded = Set<String>()
+
+    /// Before tip-off, for followed teams: "Kentucky tips off in 30 min". Once per game.
+    /// Returns the ids it reminded about (for testing).
+    @discardableResult
+    func remind(_ games: [Game], followed: Set<String>, now: Date = Date()) -> [String] {
+        let mins = Prefs.reminderMinutes
+        guard mins > 0 else { return [] }
+        var out: [String] = []
+        for g in games where g.state == .upcoming {
+            guard followed.contains(g.away.teamID) || followed.contains(g.home.teamID) else { continue }
+            let until = g.start.timeIntervalSince(now)
+            guard until > 0, until <= Double(mins) * 60, reminded.insert(g.id).inserted else { continue }
+            out.append(g.id)
+            let mine = followed.contains(g.away.teamID) ? g.away : g.home
+            func label(_ s: Side) -> String { (s.rank.map { "#\($0) " } ?? s.seed.map { "(\($0)) " } ?? "") + s.name }
+            let content = UNMutableNotificationContent()
+            let left = max(1, Int((until / 60).rounded()))
+            content.title = "🏀 \(mine.name) tips off in \(left) min"
+            content.body = "\(label(g.away)) @ \(label(g.home))" + (g.network.map { " · \($0)" } ?? "")
+            content.sound = .default
+            UNUserNotificationCenter.current().add(
+                UNNotificationRequest(identifier: "\(g.id)-reminder", content: content, trigger: nil))
+        }
+        return out
     }
 
     // MARK: Permission

@@ -102,14 +102,57 @@ enum Prefs {
         set { d.set(newValue, forKey: "useTeamColors") }
     }
 
-    static var autoCheckUpdates: Bool {
-        get { d.object(forKey: "autoCheckUpdates") as? Bool ?? true }
-        set { d.set(newValue, forKey: "autoCheckUpdates") }
+    /// Spoiler-free mode: 0 off, 1 hide scores of games with a team you follow, 2 hide every score.
+    static var spoilerMode: Int {
+        get { min(max(d.integer(forKey: "spoilerMode"), 0), 2) }
+        set { d.set(newValue, forKey: "spoilerMode") }
     }
-    /// The newest version we've already told the user about, so automatic checks don't nag.
-    static var lastPromptedVersion: String? {
-        get { d.string(forKey: "lastPromptedVersion") }
-        set { d.set(newValue, forKey: "lastPromptedVersion") }
+    /// A gold MARQUEE badge on big matchups (two top-10 teams).
+    static var showMarquee: Bool {
+        get { d.object(forKey: "showMarquee") as? Bool ?? true }
+        set { d.set(newValue, forKey: "showMarquee") }
+    }
+    /// Notify when a new AP poll comes out.
+    static var pollAlerts: Bool {
+        get { d.bool(forKey: "pollAlerts") }
+        set { d.set(newValue, forKey: "pollAlerts") }
+    }
+    /// Ticker text size: an index into `textSizes`.
+    static let textSizes: [(name: String, points: CGFloat)] = [("Small", 18), ("Medium", 22), ("Large", 26), ("Extra large", 32)]
+    static var textSize: Int {
+        get { min(max(d.object(forKey: "textSize") as? Int ?? 1, 0), textSizes.count - 1) }
+        set { d.set(newValue, forKey: "textSize") }
+    }
+    static var fontPoints: CGFloat { textSizes[textSize].points }
+    /// How solid the bar is, 0.4 (see-through) to 1.
+    static var barOpacity: Double {
+        get { min(max(d.object(forKey: "barOpacity") as? Double ?? 1.0, 0.4), 1.0) }
+        set { d.set(newValue, forKey: "barOpacity") }
+    }
+    /// What clicking a game does: 0 opens a box score popup, 1 opens its ESPN page.
+    static var clickAction: Int {
+        get { d.integer(forKey: "clickAction") }
+        set { d.set(newValue, forKey: "clickAction") }
+    }
+    /// Show the followed team's score in the menu bar item.
+    static var menuBarScore: Bool {
+        get { d.bool(forKey: "menuBarScore") }
+        set { d.set(newValue, forKey: "menuBarScore") }
+    }
+    /// Hide the ticker unless a followed team's game is live or about to start.
+    static var autoHide: Bool {
+        get { d.bool(forKey: "autoHide") }
+        set { d.set(newValue, forKey: "autoHide") }
+    }
+    /// Only show live and upcoming games on these channels (empty = every channel).
+    static var channelFilter: [String] {
+        get { d.stringArray(forKey: "channelFilter") ?? [] }
+        set { d.set(newValue, forKey: "channelFilter") }
+    }
+    /// Minutes before tip-off to remind about a followed team's game (0 = off).
+    static var reminderMinutes: Int {
+        get { d.integer(forKey: "reminderMinutes") }
+        set { d.set(newValue, forKey: "reminderMinutes") }
     }
 
     static let speeds: [(String, Double)] = [("Slow", 1.0), ("Medium", 2.0), ("Fast", 3.5)]
@@ -158,7 +201,7 @@ enum LoginItem {
 
 // MARK: - Settings window
 
-enum SettingChange { case favorite, followed, conference, favoriteOnly, position, display }
+enum SettingChange { case favorite, followed, conference, favoriteOnly, position, display, visibility, look }
 
 @MainActor
 final class SettingsController: NSObject {
@@ -171,6 +214,18 @@ final class SettingsController: NSObject {
     private let extraPopup = NSPopUpButton(frame: .zero, pullsDown: true)
     private let conferencePopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let top25Popup = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let spoilerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let marqueeBox = NSButton(checkboxWithTitle: "Marquee matchup tags (two top-10 teams)", target: nil, action: nil)
+    private let pollBox = NSButton(checkboxWithTitle: "Notify me when the AP poll comes out", target: nil, action: nil)
+    private let sizePopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let opacitySlider = NSSlider(value: 1, minValue: 0.4, maxValue: 1, target: nil, action: nil)
+    private let opacityLabel = NSTextField(labelWithString: "100%")
+    private let clickPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let reminderPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    private let channelPopup = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let menuScoreBox = NSButton(checkboxWithTitle: "Show my team's score in the menu bar", target: nil, action: nil)
+    private let autoHideBox = NSButton(checkboxWithTitle: "Hide the bar unless my team is playing", target: nil, action: nil)
+    private let reminderValues = [0, 15, 30, 60]
     private let displayPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let hoverBox = NSButton(checkboxWithTitle: "Pause while the pointer is over it", target: nil, action: nil)
     private let flashPopup = NSPopUpButton(frame: .zero, pullsDown: false)
@@ -204,7 +259,15 @@ final class SettingsController: NSObject {
         conferencePopup.addItem(withTitle: "All Division I")
         top25Popup.addItem(withTitle: "Loading…")
         top25Popup.isEnabled = false
-        for c: NSControl in [teamPopup, conferencePopup, favoriteOnlyBox, colorsBox, notifyBox, positionPopup, displayPopup, speedPopup, hoverBox, flashPopup, rankedBox, finalsBox, upcomingBox, recordsBox, logosBox, tagsBox, loginBox, updatesBox] {
+        spoilerPopup.addItems(withTitles: ["Off", "My teams' games only", "All games"])
+        sizePopup.addItems(withTitles: Prefs.textSizes.map { $0.name })
+        opacitySlider.isContinuous = true
+        opacityLabel.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
+        clickPopup.addItems(withTitles: ["Shows a box score", "Opens the ESPN page"])
+        reminderPopup.addItems(withTitles: ["Off", "15 minutes before tip-off", "30 minutes before tip-off", "1 hour before tip-off"])
+        channelPopup.addItem(withTitle: "All channels")
+        channelPopup.isEnabled = false
+        for c: NSControl in [teamPopup, conferencePopup, spoilerPopup, marqueeBox, pollBox, sizePopup, opacitySlider, clickPopup, reminderPopup, menuScoreBox, autoHideBox, favoriteOnlyBox, colorsBox, notifyBox, positionPopup, displayPopup, speedPopup, hoverBox, flashPopup, rankedBox, finalsBox, upcomingBox, recordsBox, logosBox, tagsBox, loginBox, updatesBox] {
             c.target = self
             c.action = #selector(changed(_:))
         }
@@ -238,54 +301,115 @@ final class SettingsController: NSObject {
             "Big moments: lead changes, ties, and one-possession games in the last 4 minutes.")
         flashHint.font = .systemFont(ofSize: 11)
         flashHint.textColor = .secondaryLabelColor
-        let showStack = NSStackView(views: [rankedBox, finalsBox, upcomingBox, logosBox, recordsBox, tagsBox, flashRow, flashHint])
+        let showStack = NSStackView(views: [rankedBox, finalsBox, upcomingBox, logosBox, recordsBox, tagsBox, marqueeBox, flashRow, flashHint])
         showStack.orientation = .vertical
         showStack.alignment = .leading
         showStack.spacing = 6
 
         func label(_ s: String) -> NSTextField { NSTextField(labelWithString: s) }
-        let grid = NSGridView(views: [
+        func small(_ text: String) -> NSTextField {
+            let t = NSTextField(wrappingLabelWithString: text)
+            t.font = .systemFont(ofSize: 11)
+            t.textColor = .secondaryLabelColor
+            return t
+        }
+        func stack(_ views: [NSView]) -> NSStackView {
+            let v = NSStackView(views: views)
+            v.orientation = .vertical; v.alignment = .leading; v.spacing = 2
+            return v
+        }
+        let channelHint = small("Live and upcoming games only. Games for teams you follow always show.")
+        let autoHideHint = small("The bar appears when a game is live or about to start. Use Show Ticker in the menu to see it any time.")
+        let menuHint = small("Use Hide Ticker in the menu for a menu-bar-only ticker.")
+        let opacityRow = NSStackView(views: [opacitySlider, opacityLabel])
+        opacityRow.spacing = 8
+        opacitySlider.widthAnchor.constraint(equalToConstant: 210).isActive = true
+        opacityLabel.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        let spoilerHint = small("Hides the score, close-game and upset tags, and the box score for games you're recording. Alerts won't give away a result either.")
+        let spoilerStack = stack([spoilerPopup, spoilerHint])
+        let channelStack = stack([channelPopup, channelHint])
+        let autoHideStack = stack([autoHideBox, autoHideHint])
+        let menuStack = stack([menuScoreBox, menuHint])
+
+        func page(_ rows: [[NSView]], topAlignedRow: Int? = nil) -> NSView {
+            let grid = NSGridView(views: rows)
+            grid.column(at: 0).xPlacement = .trailing
+            grid.rowAlignment = .firstBaseline
+            if let r = topAlignedRow { grid.row(at: r).rowAlignment = .none; grid.row(at: r).yPlacement = .top }
+            grid.rowSpacing = 12
+            grid.columnSpacing = 10
+            grid.translatesAutoresizingMaskIntoConstraints = false
+            let v = NSView()
+            v.addSubview(grid)
+            NSLayoutConstraint.activate([
+                grid.topAnchor.constraint(equalTo: v.topAnchor, constant: 16),
+                grid.bottomAnchor.constraint(lessThanOrEqualTo: v.bottomAnchor, constant: -16),
+                grid.leadingAnchor.constraint(equalTo: v.leadingAnchor, constant: 20),
+                grid.trailingAnchor.constraint(equalTo: v.trailingAnchor, constant: -20),
+            ])
+            return v
+        }
+        let empty = NSGridCell.emptyContentView
+        let teamsPage = page([
             [label("Follow your favorite team:"), teamPopup],
-            [NSGridCell.emptyContentView, hint],
+            [empty, hint],
             [label("Also follow:"), extraPopup],
-            [NSGridCell.emptyContentView, onlyStack],
-            [NSGridCell.emptyContentView, notifyStack],
+            [empty, onlyStack],
+            [empty, notifyStack],
+            [label("Remind me:"), reminderPopup],
+            [empty, pollBox],
             [label("Games from:"), conferencePopup],
+            [label("Only games on:"), channelStack],
+        ], topAlignedRow: 8)
+        let lookPage = page([
             [label("Position:"), positionPopup],
             [label("Display:"), displayPopup],
             [label("Scroll speed:"), speedPopup],
-            [NSGridCell.emptyContentView, hoverBox],
+            [label("Text size:"), sizePopup],
+            [label("Bar opacity:"), opacityRow],
+            [empty, hoverBox],
+            [label("Menu bar:"), menuStack],
+            [label("Ticker bar:"), autoHideStack],
+        ])
+        let gamesPage = page([
             [label("Show:"), showStack],
+            [label("Clicking a game:"), clickPopup],
+            [label("Spoiler-free:"), spoilerStack],
+        ], topAlignedRow: 0)
+        let generalPage = page([
             [label("Startup:"), loginBox],
             [label("Updates:"), updatesBox],
             [label("AP Top 25:"), top25Popup],
         ])
-        grid.column(at: 0).xPlacement = .trailing
-        grid.rowAlignment = .firstBaseline
-        grid.row(at: 10).rowAlignment = .none
-        grid.row(at: 10).yPlacement = .top
-        grid.rowSpacing = 12
-        grid.columnSpacing = 10
-        grid.translatesAutoresizingMaskIntoConstraints = false
-
-        let content = NSView()
-        content.addSubview(grid)
         NSLayoutConstraint.activate([
-            grid.topAnchor.constraint(equalTo: content.topAnchor, constant: 20),
-            grid.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -20),
-            grid.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 20),
-            grid.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -20),
             teamPopup.widthAnchor.constraint(equalToConstant: 280),
             extraPopup.widthAnchor.constraint(equalToConstant: 280),
             conferencePopup.widthAnchor.constraint(equalToConstant: 280),
+            reminderPopup.widthAnchor.constraint(equalToConstant: 280),
+            channelPopup.widthAnchor.constraint(equalToConstant: 280),
             top25Popup.widthAnchor.constraint(equalToConstant: 280),
             hint.widthAnchor.constraint(equalToConstant: 280),
             onlyHint.widthAnchor.constraint(equalToConstant: 280),
             notifyHint.widthAnchor.constraint(equalToConstant: 280),
             flashHint.widthAnchor.constraint(equalToConstant: 280),
+            channelHint.widthAnchor.constraint(equalToConstant: 280),
+            spoilerHint.widthAnchor.constraint(equalToConstant: 280),
+            autoHideHint.widthAnchor.constraint(equalToConstant: 280),
+            menuHint.widthAnchor.constraint(equalToConstant: 280),
         ])
-        window.contentView = content
-        window.setContentSize(content.fittingSize)
+
+        let tabs = NSTabView()
+        for (title, view) in [("Teams", teamsPage), ("Ticker", lookPage), ("Games", gamesPage), ("General", generalPage)] {
+            let item = NSTabViewItem(identifier: title)
+            item.label = title
+            item.view = view
+            tabs.addTabViewItem(item)
+        }
+        let sizes = [teamsPage, lookPage, gamesPage, generalPage].map { $0.fittingSize }
+        tabs.setFrameSize(NSSize(width: (sizes.map { $0.width }.max() ?? 480) + 24,
+                                 height: (sizes.map { $0.height }.max() ?? 300) + 56))
+        window.contentView = tabs
+        window.setContentSize(tabs.frame.size)
         sync()
     }
 
@@ -304,6 +428,46 @@ final class SettingsController: NSObject {
         top25Popup.menu = menu
         top25Popup.autoenablesItems = false
         top25Popup.isEnabled = true
+    }
+
+    /// The channels seen in today's data, for the "Only games on" menu.
+    func setChannels(_ names: [String]) {
+        let menu = NSMenu()
+        menu.addItem(NSMenuItem(title: "", action: nil, keyEquivalent: ""))   // the pull-down's title
+        let all = NSMenuItem(title: "All channels", action: #selector(channelsCleared), keyEquivalent: "")
+        all.target = self
+        menu.addItem(all)
+        menu.addItem(.separator())
+        for n in names {
+            let it = NSMenuItem(title: n, action: #selector(channelToggled(_:)), keyEquivalent: "")
+            it.target = self
+            menu.addItem(it)
+        }
+        channelPopup.menu = menu
+        channelPopup.isEnabled = true
+        syncChannels()
+    }
+
+    private func syncChannels() {
+        guard let menu = channelPopup.menu, menu.items.count > 3 else { return }
+        let picked = Set(Prefs.channelFilter)
+        for it in menu.items.dropFirst(3) { it.state = picked.contains(it.title) ? .on : .off }
+        menu.items[0].title = picked.isEmpty ? "All channels"
+            : (picked.count <= 2 ? picked.sorted().joined(separator: ", ") : "\(picked.count) channels")
+    }
+
+    @objc private func channelToggled(_ item: NSMenuItem) {
+        var picked = Prefs.channelFilter
+        if let i = picked.firstIndex(of: item.title) { picked.remove(at: i) } else { picked.append(item.title) }
+        Prefs.channelFilter = picked
+        syncChannels()
+        onChange?(.display)
+    }
+
+    @objc private func channelsCleared() {
+        Prefs.channelFilter = []
+        syncChannels()
+        onChange?(.display)
     }
 
     func setConferences(_ list: [Conference]) {
@@ -371,6 +535,19 @@ final class SettingsController: NSObject {
         notifyBox.isEnabled = Prefs.favoriteTeamID != nil
         positionPopup.selectItem(at: Prefs.atTop ? 1 : 0)
         syncExtras()
+        syncChannels()
+        spoilerPopup.selectItem(at: Prefs.spoilerMode)
+        marqueeBox.state = Prefs.showMarquee ? .on : .off
+        pollBox.state = Prefs.pollAlerts ? .on : .off
+        sizePopup.selectItem(at: Prefs.textSize)
+        opacitySlider.doubleValue = Prefs.barOpacity
+        opacityLabel.stringValue = "\(Int((Prefs.barOpacity * 100).rounded()))%"
+        clickPopup.selectItem(at: Prefs.clickAction)
+        reminderPopup.selectItem(at: reminderValues.firstIndex(of: Prefs.reminderMinutes) ?? 0)
+        reminderPopup.isEnabled = !Prefs.followedIDs.isEmpty
+        menuScoreBox.state = Prefs.menuBarScore ? .on : .off
+        autoHideBox.state = Prefs.autoHide ? .on : .off
+        autoHideBox.isEnabled = !Prefs.followedIDs.isEmpty
         let confIdx = conferencePopup.itemArray.firstIndex {
             ($0.representedObject as? Int) == Prefs.conferenceID && Prefs.conferenceID != nil
         } ?? 0
@@ -385,7 +562,7 @@ final class SettingsController: NSObject {
         tagsBox.state = Prefs.showAlertTags ? .on : .off
         logosBox.state = Prefs.showLogos ? .on : .off
         flashPopup.selectItem(at: Prefs.flashMode)
-        updatesBox.state = Prefs.autoCheckUpdates ? .on : .off
+        updatesBox.state = UpdateService.shared.automaticallyChecks ? .on : .off
         loginBox.state = LoginItem.isEnabled ? .on : .off
         loginBox.isEnabled = LoginItem.isSupported
         if !LoginItem.isSupported { loginBox.title = "Open at login (needs macOS 13 or later)" }
@@ -449,6 +626,44 @@ final class SettingsController: NSObject {
         case positionPopup:
             Prefs.atTop = positionPopup.indexOfSelectedItem == 1
             onChange?(.position)
+        case spoilerPopup:
+            Prefs.spoilerMode = max(0, spoilerPopup.indexOfSelectedItem)
+            onChange?(.display)
+        case marqueeBox:
+            Prefs.showMarquee = marqueeBox.state == .on
+            onChange?(.display)
+        case pollBox:
+            guard pollBox.state == .on else { Prefs.pollAlerts = false; return }
+            TeamAlerts.requestPermission { [weak self] ok in
+                Prefs.pollAlerts = ok
+                self?.pollBox.state = ok ? .on : .off
+            }
+        case sizePopup:
+            Prefs.textSize = max(0, sizePopup.indexOfSelectedItem)
+            onChange?(.look)
+        case opacitySlider:
+            let v = (opacitySlider.doubleValue * 20).rounded() / 20   // steps of 5%
+            Prefs.barOpacity = v
+            opacityLabel.stringValue = "\(Int((v * 100).rounded()))%"
+            onChange?(.look)
+        case clickPopup:
+            Prefs.clickAction = max(0, clickPopup.indexOfSelectedItem)
+        case reminderPopup:
+            let mins = reminderValues[max(0, reminderPopup.indexOfSelectedItem)]
+            Prefs.reminderMinutes = mins
+            if mins > 0 {
+                TeamAlerts.requestPermission { [weak self] ok in
+                    guard !ok else { return }
+                    Prefs.reminderMinutes = 0
+                    self?.reminderPopup.selectItem(at: 0)
+                }
+            }
+        case menuScoreBox:
+            Prefs.menuBarScore = menuScoreBox.state == .on
+            onChange?(.display)
+        case autoHideBox:
+            Prefs.autoHide = autoHideBox.state == .on
+            onChange?(.visibility)
         case conferencePopup:
             Prefs.conferenceID = conferencePopup.selectedItem?.representedObject as? Int
             onChange?(.conference)
@@ -493,7 +708,7 @@ final class SettingsController: NSObject {
             LoginItem.set(loginBox.state == .on)
             loginBox.state = LoginItem.isEnabled ? .on : .off   // reflect what macOS actually did
         case updatesBox:
-            Prefs.autoCheckUpdates = updatesBox.state == .on
+            UpdateService.shared.automaticallyChecks = updatesBox.state == .on
         default:
             break
         }
